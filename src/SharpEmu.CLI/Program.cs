@@ -1378,11 +1378,11 @@ internal static partial class Program
             pathTokens.Add(argument);
         }
 
-        if (OperatingSystem.IsAndroid() && cpuEngine != CpuExecutionEngine.Interpreter)
+        if (OperatingSystem.IsAndroid() && cpuEngine == CpuExecutionEngine.NativeOnly)
         {
             Console.Error.WriteLine(
-                "[LOADER][ERROR] Native execution is impossible on Android/ARM64; " +
-                "omit --cpu-engine or pass --cpu-engine=interpreter.");
+                "[LOADER][ERROR] Native x64 execution is impossible on Android/ARM64; " +
+                "use --cpu-engine=jit or --cpu-engine=interpreter.");
             ebootPath = string.Empty;
             runtimeOptions = default;
             logLevel = SharpEmuLog.MinimumLevel;
@@ -1563,6 +1563,15 @@ internal static partial class Program
             string.Equals(valueText, "x64-interpreter", StringComparison.OrdinalIgnoreCase))
         {
             engine = CpuExecutionEngine.Interpreter;
+            return true;
+        }
+
+        if (string.Equals(valueText, "jit", StringComparison.OrdinalIgnoreCase) ||
+            string.Equals(valueText, "jitrecompiler", StringComparison.OrdinalIgnoreCase) ||
+            string.Equals(valueText, "jit-recompiler", StringComparison.OrdinalIgnoreCase) ||
+            string.Equals(valueText, "recompiler", StringComparison.OrdinalIgnoreCase))
+        {
+            engine = CpuExecutionEngine.JitRecompiler;
             return true;
         }
 

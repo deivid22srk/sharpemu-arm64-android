@@ -292,12 +292,13 @@ public sealed class CpuDispatcher : ICpuDispatcher, IDisposable
             sentinelValue: returnToHostStubAddress,
             entryParamsConfigured: entryParamsConfigured);
 
-        if (executionOptions.CpuEngine == CpuExecutionEngine.Interpreter)
+        if (executionOptions.CpuEngine == CpuExecutionEngine.Interpreter || executionOptions.CpuEngine == CpuExecutionEngine.JitRecompiler)
         {
+            var isJit = executionOptions.CpuEngine == CpuExecutionEngine.JitRecompiler;
             LastMilestoneLog = string.Concat(
                 entryFrameDiagnostic,
                 Environment.NewLine,
-                $"CpuEngine: x64-interpreter trace={executionOptions.InterpreterTrace} max_instructions={executionOptions.EffectiveInterpreterMaxInstructions}");
+                $"CpuEngine: {(isJit ? "arm64-jit-recompiler" : "x64-interpreter")} trace={executionOptions.InterpreterTrace} max_instructions={executionOptions.EffectiveInterpreterMaxInstructions}");
 
             var interpreterOptions = new X64InterpreterOptions
             {
@@ -311,11 +312,125 @@ public sealed class CpuDispatcher : ICpuDispatcher, IDisposable
                 interpreterOptions);
             var previousGuestThreadScheduler = GuestThreadExecution.Scheduler;
             GuestThreadExecution.Scheduler = interpreterScheduler;
+
             X64InterpreterResult interpreterResult;
             try
             {
-                var interpreter = new X64InterpreterBackend(_moduleManager, interpreterScheduler);
-                interpreterResult = interpreter.Execute(context, entryPoint, effectiveImportStubs, interpreterOptions);
+                if (isJit)
+                {
+                    using var blockCache = new SharpEmu.Core.Cpu.Jit.JitBlockCache();
+                    var interpreter = new X64InterpreterBackend(_moduleManager, interpreterScheduler);
+
+                    // JIT dispatch loop
+                    var concreteImportStubs = effectiveImportStubs as Dictionary<ulong, string> ?? new Dictionary<ulong, string>(effectiveImportStubs);
+                    context.Rip = entryPoint;
+                    var executedInstructions = 0;
+                    var importsHit = 0;
+                    var uniqueImports = new HashSet<string>(StringComparer.Ordinal);
+
+                    while (context.Rip != 0)
+                    {
+                        if (concreteImportStubs.TryGetValue(context.Rip, out var nid))
+                        {
+                            importsHit++;
+                            uniqueImports.Add(nid);
+                            _ = _moduleManager.Dispatch(nid, context);
+
+                            if (GuestThreadExecution.TryConsumeCurrentEntryExit(out var exitValue, out _))
+                            {
+                                context[CpuRegister.Rax] = exitValue;
+                                break;
+                            }
+
+                            if (GuestThreadExecution.TryConsumeCurrentThreadBlock(
+                                    out _, out _, out _, out var wakeKey, out var waiter, out var blockDeadline))
+                            {
+                                interpreterScheduler.TryBlockCurrentThread(wakeKey, blockDeadline);
+                                if (waiter is not null)
+                                {
+                                    context[CpuRegister.Rax] = unchecked((ulong)waiter.Resume());
+                                }
+                            }
+
+                            if (!context.PopUInt64(out var returnAddress))
+                            {
+                                break;
+                            }
+
+                            context.Rip = returnAddress;
+                            continue;
+                        }
+
+                        // JIT compilation/execution block attempt
+                        try
+                        {
+                            var cachedBlock = blockCache.GetOrCompile(context, context.Rip);
+                            executedInstructions += cachedBlock.InstructionCount;
+
+                            // Execute translated block
+                            if (System.Runtime.InteropServices.RuntimeInformation.ProcessArchitecture == System.Runtime.InteropServices.Architecture.Arm64)
+                            {
+                                unsafe
+                                {
+                                    fixed (ulong* regsPtr = context.RegistersArray)
+                                    {
+                                        var nextRip = cachedBlock.CompiledFunc((IntPtr)regsPtr, IntPtr.Zero);
+                                        if (nextRip != context.Rip && nextRip != 0)
+                                        {
+                                            context.Rip = nextRip;
+                                        }
+                                        else
+                                        {
+                                            // Fallback single-instruction execution via interpreter
+                                            var singleStepResult = interpreter.Execute(context, context.Rip, effectiveImportStubs, new X64InterpreterOptions { MaxInstructions = 1 });
+                                            if (singleStepResult.Result != OrbisGen2Result.ORBIS_GEN2_OK)
+                                            {
+                                                interpreterResult = singleStepResult;
+                                                goto JitFinished;
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                            else
+                            {
+                                // On x64 hosts (e.g. dev/CI machine), block compilation is verified and execution steps via interpreter fallback
+                                var singleStepResult = interpreter.Execute(context, context.Rip, effectiveImportStubs, new X64InterpreterOptions { MaxInstructions = Math.Max(1, cachedBlock.InstructionCount) });
+                                if (singleStepResult.Result != OrbisGen2Result.ORBIS_GEN2_OK)
+                                {
+                                    interpreterResult = singleStepResult;
+                                    goto JitFinished;
+                                }
+                            }
+                        }
+                        catch
+                        {
+                            // Fallback to interpreter for unsupported or invalid blocks
+                            var singleStepResult = interpreter.Execute(context, context.Rip, effectiveImportStubs, new X64InterpreterOptions { MaxInstructions = 1 });
+                            if (singleStepResult.Result != OrbisGen2Result.ORBIS_GEN2_OK)
+                            {
+                                interpreterResult = singleStepResult;
+                                goto JitFinished;
+                            }
+                        }
+                    }
+
+                    interpreterResult = new X64InterpreterResult(
+                        OrbisGen2Result.ORBIS_GEN2_OK,
+                        CpuExitReason.ReturnedToHost,
+                        context.Rip,
+                        executedInstructions,
+                        importsHit,
+                        uniqueImports.Count,
+                        null, null, null, null, string.Empty);
+
+                    JitFinished: ;
+                }
+                else
+                {
+                    var interpreter = new X64InterpreterBackend(_moduleManager, interpreterScheduler);
+                    interpreterResult = interpreter.Execute(context, entryPoint, effectiveImportStubs, interpreterOptions);
+                }
             }
             finally
             {
