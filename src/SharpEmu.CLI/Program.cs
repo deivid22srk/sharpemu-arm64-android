@@ -1000,7 +1000,7 @@ internal static partial class Program
 
     private static void PrintUsage()
     {
-        Log.Info("Usage: SharpEmu.CLI [--strict] [--trace-imports[=N]] [--cpu-engine=<native|interpreter>] [--cpu-interpreter-trace[=true|false]] [--cpu-interpreter-max-instructions=<N>] [--log-level=<level>] [--log-file[=<path>]] [--window-mode=<windowed|borderless|exclusive>] [--resolution=<WIDTHxHEIGHT>] [--display=<N>] [--refresh-rate=<HZ>] [--scaling=<fit|cover|stretch|integer>] [--vsync=<on|off>] [--hdr=<auto|on|off>] [--start-minimized] [--debug-server[=host:port]] <path-to-eboot.bin>");
+        Log.Info("Usage: SharpEmu.CLI [--strict] [--trace-imports[=N]] [--cpu-engine=<native|interpreter>] [--cpu-interpreter-trace[=true|false]] [--cpu-interpreter-max-instructions=<N>] [--cpu-no-block-cache[=true|false]] [--log-level=<level>] [--log-file[=<path>]] [--window-mode=<windowed|borderless|exclusive>] [--resolution=<WIDTHxHEIGHT>] [--display=<N>] [--refresh-rate=<HZ>] [--scaling=<fit|cover|stretch|integer>] [--vsync=<on|off>] [--hdr=<auto|on|off>] [--start-minimized] [--debug-server[=host:port]] <path-to-eboot.bin>");
         Log.Info(@"Example: SharpEmu.CLI --cpu-engine=interpreter --cpu-interpreter-trace=true --cpu-interpreter-max-instructions=100000 --trace-imports=64 --log-level=debug --log-file ""E:\Games\...\eboot.bin""");
         Log.Info("Debug server: --debug-server starts a live debug listener (default 127.0.0.1:5714); connect with SharpEmu.DebugClient.");
     }
@@ -1069,6 +1069,7 @@ internal static partial class Program
         var cpuEngine = CpuExecutionEngine.Interpreter;
         var interpreterTrace = false;
         var interpreterMaxInstructions = 0;
+        var noBlockCache = false;
         HostWindowMode? windowModeOverride = null;
         HostScalingMode? scalingModeOverride = null;
         int? windowWidthOverride = null;
@@ -1241,6 +1242,27 @@ internal static partial class Program
                 continue;
             }
 
+            if (string.Equals(argument, "--cpu-no-block-cache", StringComparison.OrdinalIgnoreCase))
+            {
+                noBlockCache = true;
+                continue;
+            }
+
+            const string noBlockCachePrefix = "--cpu-no-block-cache=";
+            if (argument.StartsWith(noBlockCachePrefix, StringComparison.OrdinalIgnoreCase))
+            {
+                if (!TryParseSwitch(argument[noBlockCachePrefix.Length..], out noBlockCache))
+                {
+                    ebootPath = string.Empty;
+                    runtimeOptions = default;
+                    logLevel = SharpEmuLog.MinimumLevel;
+                    logFilePath = null;
+                    return false;
+                }
+
+                continue;
+            }
+
             if (string.Equals(argument, "--cpu-interpreter-max-instructions", StringComparison.OrdinalIgnoreCase))
             {
                 if (i + 1 >= args.Length ||
@@ -1405,6 +1427,7 @@ internal static partial class Program
             CpuEngine = cpuEngine,
             InterpreterTrace = interpreterTrace,
             InterpreterMaxInstructions = interpreterMaxInstructions,
+            InterpreterBlockCacheDisabled = noBlockCache,
             StrictDynlibResolution = strictDynlibResolution,
             ImportTraceLimit = importTraceLimit,
         };

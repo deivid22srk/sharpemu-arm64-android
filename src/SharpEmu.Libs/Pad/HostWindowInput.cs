@@ -125,7 +125,24 @@ public static class HostWindowInput
         {
             lock (Gate)
             {
-                if (!_gamepadConnected || destination.IsEmpty)
+                if (destination.IsEmpty)
+                {
+                    return 0;
+                }
+
+                // Virtual (host-injected) pad — the Android touch overlay writes here through
+                // GameSession.SetPadButton/SetPadAxis. A physical controller, when present,
+                // stays authoritative for axes whenever the overlay is at rest; virtual buttons
+                // always OR in. See VirtualPadInput's doc comment for the merge rules.
+                if (VirtualPadInput.HasInput)
+                {
+                    destination[0] = _gamepadConnected
+                        ? VirtualPadInput.MergeInto(_gamepadState)
+                        : VirtualPadInput.BuildStandaloneState();
+                    return 1;
+                }
+
+                if (!_gamepadConnected)
                 {
                     return 0;
                 }

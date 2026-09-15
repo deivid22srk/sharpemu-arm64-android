@@ -4,6 +4,7 @@
 using SharpEmu.Core.Cpu;
 using SharpEmu.Core.Runtime;
 using SharpEmu.HLE;
+using SharpEmu.Libs.Pad;
 using SharpEmu.Libs.VideoOut;
 using SharpEmu.Logging;
 
@@ -80,22 +81,34 @@ internal static class GameSession
         finally
         {
             _runtime = null;
+            VirtualPadInput.Clear();
         }
     }
 
     public static void Stop()
     {
-        // TODO: ISharpEmuRuntime has no cooperative-stop entry point yet (the desktop CLI's own
-        // Ctrl+C handler just calls VideoOutExports.NotifyHostInterrupt() — wire the same call here
-        // once GameActivity needs to interrupt a run in progress, e.g. the user backing out mid-game
-        // rather than letting the process/":game" Activity simply be torn down).
+        // Same cooperative shutdown the desktop CLI's Ctrl+C handler uses (Program.cs calls
+        // VideoOutExports.NotifyHostInterrupt on SIGINT): it flips VideoOut's vblank loop stop
+        // flag, requests the host session shutdown, asks the guest GPU backend to close, and
+        // gives guest/GPU threads a bounded window to leave before the process tears down —
+        // so "back out of the game" from the Android UI ends the run cleanly instead of only
+        // killing the Activity.
+        VideoOutExports.NotifyHostInterrupt();
     }
 
     // --- Virtual gamepad -------------------------------------------------------------------
-    // TODO: route through the same guest-visible pad state SdlHostWindow/HostWindowInput already
-    // maintain for physical controllers, so a touch-overlay press is indistinguishable from a real
-    // SDL gamepad event to the emulator core (matching desktop's existing single code path).
-    public static void SetPadButton(int button, bool pressed) { }
-    public static void SetPadAxis(int axis, int value) { }
-    public static void RequestRenderDiagCapture() { }
+    // The touch overlay's state funnels through VirtualPadInput into the SAME host input path
+    // (HostWindowInput's IHostWindowInputSource) the desktop SDL window feeds with physical
+    // controller state — PadExports.ReadHostInputState polls that one path on every platform,
+    // so a touch-overlay press is indistinguishable from a real SDL gamepad event to the
+    // emulator core. VirtualPadInput.Clear() runs when the session above ends.
+    public static void SetPadButton(int button, bool pressed) => VirtualPadInput.SetButton(button, pressed);
+    public static void SetPadAxis(int axis, int value) => VirtualPadInput.SetAxis(axis, value);
+
+    /// <summary>
+    /// Requests the next presented frame be captured — the same RenderDoc in-app capture the
+    /// desktop SDL window triggers with F10 (SdlHostWindow). No-ops safely when RenderDoc was
+    /// not injected (RenderDocCapture.RequestCapture only acts when its API was initialized).
+    /// </summary>
+    public static void RequestRenderDiagCapture() => RenderDocCapture.RequestCapture();
 }

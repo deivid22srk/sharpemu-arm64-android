@@ -303,6 +303,7 @@ public sealed class CpuDispatcher : ICpuDispatcher, IDisposable
             {
                 Trace = executionOptions.InterpreterTrace,
                 MaxInstructions = executionOptions.EffectiveInterpreterMaxInstructions,
+                DisableBlockCache = executionOptions.InterpreterBlockCacheDisabled,
             };
             var interpreterScheduler = new X64InterpreterGuestThreadScheduler(
                 this,

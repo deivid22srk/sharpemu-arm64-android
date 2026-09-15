@@ -37,6 +37,35 @@ This proof of concept currently uses an **adapted interpreter created mainly to 
 | **Dreaming Sarah** | **Booting** | Boots as a proof of concept, but is **not playable**. |
 | ![Dreaming Sarah](./.github/images/dreaming-sarah.jpg) | | |
 
+### CPU execution: basic-block cached interpreter
+
+The guest CPU backend now executes hot code through a **basic-block decode cache**
+("cached interpreter") — blocks are decoded once with Iced and validated as one contiguous
+byte range per execution, instead of re-decoding every instruction every time it runs
+(see `src/SharpEmu.Core/Cpu/Interpreter/X64BlockCache.cs` and
+[`ARCHITECTURE_DECISION.md`](./ARCHITECTURE_DECISION.md) for the full rationale and the
+measured 2.65x desktop speedup). Guest-visible semantics are unchanged — the legacy
+per-instruction path remains as the universal fallback and is kept byte-identical by
+parity tests (`X64InterpreterBlockCacheTests`), and it stays as the foundation for the
+planned ARM64 JIT recompiler (phases 2-5 in the decision document).
+
+This is also the long-term execution strategy decision for the Android/ARM64 port:
+cached interpreter now, JIT recompiler later on top of the same block infrastructure.
+
+### Android touch controls & session control
+
+The Android touch overlay now drives the **same host input path as physical controllers**
+(`VirtualPadInput` → `HostWindowInput` → `PadExports`), so overlay presses are
+indistinguishable from SDL gamepad events to the guest, and backing out of a game requests
+the same cooperative host shutdown the desktop CLI's Ctrl+C uses
+(`GameSession.Stop()` → `VideoOutExports.NotifyHostInterrupt()`).
+
+### CI
+
+- `.github/workflows/build.yml` — builds the **debug APK** on every push to the default
+  branch (and via manual dispatch); artifact: `SharpEmu-Android-<sha>-debug.apk`.
+- `.github/workflows/android-release.yml` — unchanged: release APK on `android-v*` tags.
+
 ### Development Status
 
 Development of this project will remain **paused** until my other port, **rpPS4**, based on [shadPS4](https://github.com/shadps4-emu/shadps4), becomes sufficiently solid and functional.

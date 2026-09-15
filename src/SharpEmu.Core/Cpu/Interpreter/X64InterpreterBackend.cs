@@ -13,7 +13,7 @@ using SharpEmu.Libs.Kernel;
 
 namespace SharpEmu.Core.Cpu.Interpreter;
 
-public sealed class X64InterpreterBackend
+public sealed partial class X64InterpreterBackend
 {
     private const int MaxInstructionBytes = 15;
     private readonly IModuleManager _moduleManager;
@@ -94,7 +94,16 @@ public sealed class X64InterpreterBackend
         var trace = options.Trace ? new StringBuilder(4096) : null;
         var instructionLimit = options.MaxInstructions < 0 ? 0 : options.MaxInstructions;
 
-        for (var executed = 0; instructionLimit == 0 || executed < instructionLimit; executed++)
+        // Basic-block cached interpreter (ARCHITECTURE_DECISION.md): when enabled, hot code runs
+        // through the X64BlockCache fast path below — decoded once per block, validated once per
+        // block — while the legacy per-instruction path here remains as the universal fallback
+        // (undecodable bytes, block-build anomalies, and the defensive retry cases) so every
+        // edge case keeps its exact historical semantics.
+        var useBlockCache = !options.DisableBlockCache;
+        var skipBlockOnce = false;
+        var executed = 0;
+
+        while (instructionLimit == 0 || executed < instructionLimit)
         {
             // Diagnostic heartbeat: a long-running guest thread that never
             // logs anything else looks identical (from the outside) whether
@@ -194,8 +203,48 @@ public sealed class X64InterpreterBackend
                 }
 
                 context.Rip = returnAddress;
+                executed++;
                 continue;
             }
+
+            // Cached-block fast path: execute a whole pre-decoded basic block through the same
+            // TryExecuteInstruction handlers. Import stubs can only ever be entered at block
+            // boundaries (every control transfer ends a block, and fall-through into the stub
+            // region terminates block construction), so the stub dictionary above is probed once
+            // per block instead of once per instruction. On the defensive retry outcomes the
+            // block cache is skipped for exactly one instruction so the legacy path single-steps
+            // the offending address and progress is guaranteed.
+            if (useBlockCache && !skipBlockOnce &&
+                TryGetValidatedBlock(context, context.Rip, importStubs, out var block))
+            {
+                skipBlockOnce = false;
+                switch (TryExecuteBlock(
+                    context,
+                    block,
+                    trace,
+                    ref executed,
+                    instructionLimit,
+                    importsHit,
+                    uniqueImports.Count,
+                    out var blockResult))
+                {
+                    case BlockExecutionOutcome.Completed:
+                        continue;
+                    case BlockExecutionOutcome.RetryFromDispatcher:
+                        skipBlockOnce = true;
+                        continue;
+                    case BlockExecutionOutcome.ReturnResult:
+                        if (blockResult.HasValue)
+                        {
+                            return blockResult.Value;
+                        }
+
+                        // Unreachable: ReturnResult always carries the result to return.
+                        continue;
+                }
+            }
+
+            skipBlockOnce = false;
 
             if (!TryDecodeCached(context, context.Rip, out var instruction, out var bytes))
             {
@@ -264,15 +313,28 @@ public sealed class X64InterpreterBackend
             {
                 context.Rip = oldRip + (uint)instruction.Length;
             }
+
+            executed++;
         }
 
+        return BudgetExceeded(context, instructionLimit, executed, importsHit, uniqueImports.Count, trace);
+    }
+
+    private X64InterpreterResult BudgetExceeded(
+        CpuContext context,
+        int instructionLimit,
+        int totalInstructions,
+        int importsHit,
+        int uniqueNidsHit,
+        StringBuilder? trace)
+    {
         return Complete(
             OrbisGen2Result.ORBIS_GEN2_ERROR_NOT_IMPLEMENTED,
             CpuExitReason.BudgetExceeded,
             context.Rip,
             instructionLimit,
             importsHit,
-            uniqueImports.Count,
+            uniqueNidsHit,
             trace,
             notImplementedInfo: new CpuNotImplementedInfo(
                 CpuNotImplementedSource.InstructionBudget,

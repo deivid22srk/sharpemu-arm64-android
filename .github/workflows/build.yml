@@ -1,0 +1,89 @@
+# Copyright (C) 2026 SharpEmu Emulator Project
+# SPDX-License-Identifier: GPL-2.0-or-later
+
+name: Android Debug Build
+
+# Same pipeline shape as android-release.yml, producing a DEBUG APK instead: it runs on
+# every push to the default branch (plus manual dispatch) so the debug build is validated
+# continuously, without creating/updating a GitHub release per run. The APK is signed with
+# the auto-generated debug keystore (like the release workflow, which has no signing
+# secrets either) and published as a workflow artifact.
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - main
+      - master
+    paths-ignore:
+      - "**.md"
+      - "assets/**"
+      - ".github/images/**"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: android-debug-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  APK_VERSION: 0.0.2_poc
+  APK_NAME: SharpEmu-Android-${{ github.sha }}-debug.apk
+
+jobs:
+  build-debug:
+    name: Build Android debug APK
+    runs-on: windows-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v6
+
+      - name: Setup JDK
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+
+      - name: Setup .NET SDK
+        uses: actions/setup-dotnet@v5
+        with:
+          dotnet-version: 10.0.103
+
+      - name: Install Android workload
+        run: dotnet workload install android
+
+      # The Kotlin/Compose UI library (.aar) is a static dependency of the .NET Android app
+      # project (AndroidLibrary item pointing at app-release.aar) — its build configuration
+      # is independent of the APK's: "debug APK" here means the app project builds with
+      # -c Debug (debug-enabled, debug-keystore-signed, fast incremental path), while the
+      # embedded UI .aar always ships from the same deterministic assembleRelease output.
+      - name: Clean Gradle build outputs
+        shell: bash
+        run: rm -rf platform/android/app/build platform/android/.gradle
+
+      - name: Build Kotlin/Compose library (.aar)
+        working-directory: platform/android
+        shell: bash
+        run: ./gradlew :app:assembleRelease
+
+      - name: Clean .NET Android build outputs
+        shell: bash
+        run: rm -rf artifacts/obj/SharpEmu.Android artifacts/bin/Debug/net10.0-android
+
+      - name: Build Android APK (Debug)
+        run: dotnet build src/SharpEmu.Android/SharpEmu.Android.csproj -c Debug -f net10.0-android
+
+      - name: Rename APK artifact
+        shell: bash
+        run: |
+          set -euo pipefail
+          apk="$(find artifacts/bin/Debug/net10.0-android -iname '*-Signed.apk' | head -n1)"
+          test -n "$apk"
+          cp "$apk" "$APK_NAME"
+
+      - name: Upload debug APK artifact
+        uses: actions/upload-artifact@v7
+        with:
+          name: sharpemu-android-debug-${{ env.APK_VERSION }}
+          path: ${{ env.APK_NAME }}
+          if-no-files-found: error

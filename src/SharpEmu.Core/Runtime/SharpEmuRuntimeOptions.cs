@@ -14,6 +14,12 @@ public readonly struct SharpEmuRuntimeOptions
 
     public int InterpreterMaxInstructions { get; init; }
 
+    /// <summary>
+    /// Disables the x64 interpreter's basic-block decode cache (see
+    /// <see cref="CpuExecutionOptions.InterpreterBlockCacheDisabled"/>); default keeps it on.
+    /// </summary>
+    public bool InterpreterBlockCacheDisabled { get; init; }
+
     public bool StrictDynlibResolution { get; init; }
 
     public int ImportTraceLimit { get; init; }

@@ -1,0 +1,185 @@
+<!-- Copyright (C) 2026 SharpEmu Emulator Project -->
+<!-- SPDX-License-Identifier: GPL-2.0-or-later -->
+
+# Decisão de Arquitetura — Estratégia de Execução da CPU no Port Android/ARM64
+
+- **Status:** Aceita e implementada (Fase 1)
+- **Data:** 2026-09-15
+- **Decisores:** Port SharpEmu ARM64 (fork não oficial)
+- **Escopo:** Backend de execução da CPU convidada (x86-64 do PS4) em hosts Android ARM64
+
+---
+
+## 1. Contexto
+
+O SharpEmu emula o PS4, cuja CPU convidada é **x86-64** (AMD Jaguar). O alvo deste fork é
+**Android ARM64**, onde o código convidado não pode ser executado nativamente — toda instrução
+x86-64 precisa ser interpretada ou traduzida para ARM64.
+
+### 1.1 Estado atual (evidências do código)
+
+A implementação atual no caminho Android é um **interpretador instrução-a-instrução** com um
+**cache de decodificação por instrução** (não por bloco):
+
+- `src/SharpEmu.Core/Cpu/CpuDispatcher.cs` (`DispatchEntryCore`) — seleciona
+  `CpuExecutionEngine.Interpreter` no Android; o caminho `NativeOnly`
+  (`DirectExecutionBackend`) executa o código convidado **nativamente** e é
+  explicitamente proibido em Android/ARM64 (`PlatformNotSupportedException`).
+- `src/SharpEmu.Core/Cpu/Interpreter/X64InterpreterBackend.cs` — loop principal
+  (`Execute`, linhas 97–267). Para **cada instrução executada** ele:
+  1. testa o dicionário de stubs de importação (`TryGetValue` por RIP);
+  2. consulta o `_decodeCache` direto-mapeado de 65.536 entradas
+     (hash multiplicativo, comparação de tag, **releitura dos bytes convidados**
+     para guarda de SMC, comparação de bytes);
+  3. executa um `switch` gigante por mnemônico (`TryExecuteInstruction`);
+  4. avança RIP.
+- A decodificação Iced (`Iced.Intel.Decoder`) é, por decomposição do loop, o **custo
+  dominante** — o comentário do próprio `_decodeCache` (linhas 31–45) registra que o cache
+  existe para evitar re-decodificar "o mesmo endereço milhões de vezes".
+- **Não existe** infraestrutura de recompilação para ARM64: `JitStubs.cs`/`StubManager.cs`
+  emitem apenas trampolinos **x86-64** escritos à mão para o caminho nativo de desktop;
+  não há IR de CPU, emissor ARM64, nem cache de blocos traduzidos em lugar nenhum do repositório.
+- O README do projeto já antecipa que o backend ARM64 definitivo virá do port **rpPS4**
+  (baseado em shadPS4) — hoje este fork está pausado como "proof of concept" que faz
+  *Dreaming Sarah* apenas dar boot.
+
+### 1.2 Restrições do alvo Android
+
+- **W^X (Android 10+, targetSdk ≥ 29):** uma página não pode ser RWX; um futuro cache de
+  código exigirá esquema write→`mprotect(PROT_EXEC)`→flush de icache. A API
+  `HostMemory.FlushInstructionCache` já existe, mas o caminho RWX atual do desktop não é
+  reutilizável diretamente no Android.
+- **Espaço de endereçamento de 39 bits** em dispositivos comuns (confirmado no Galaxy S23,
+  ver comentário em `CpuDispatcher.cs`) — já tratado no fork.
+- O app Android roda o interpretador sob **Mono JIT** (`RunAOTCompilation=false`,
+  `AndroidEnableMarshalMethods=false` — ver `SharpEmu.Android.csproj`), que é menos agressivo
+  que o RyuJIT desktop: custo por instrução interpretada é ainda maior no Android.
+
+---
+
+## 2. Opções consideradas
+
+| Opção | Ganho esperado | Complexidade | Risco de instabilidade | Manutenção |
+|---|---|---|---|---|
+| **A.** Interpretador atual, sem mudanças | — (baseline) | — | — | Trivial |
+| **B.** Interpretador otimizado com **cache de blocos básicos pré-decodificados** ("cached/block interpreter") | Alto (elimina re-decodificação, hash, probe de dicionário e guarda de SMC por instrução → 1× por bloco) | Moderada (~400 linhas, sem mudança semântica) | **Baixo** (mesmos handlers de execução; semântica idêntica por construção) | Baixa |
+| **C.** Threaded interpretation (despacho direto a handlers, estilo computed goto) | Médio | Alta em C# puro (sem `goto computed`; exigiria gerar tabela de delegates ou codegen IL) | Médio | Média |
+| **D.** JIT recompiler x86-64→ARM64 (dynarec completo) | Muito alto (10–50× sobre interpretador) | **Extrema** (≈200 mnemônicos, flags parciais lazy, SMC, W^X, sinais/exceções, trampolinos HLE) | **Alto** sem anos de testes | Alta |
+
+### 2.1 Por que não o recompilador JIT agora (opção D)
+
+Um dynarec x86-64→ARM64 é o **objetivo correto de longo prazo** — é o que shadPS4/RPCS3/Dolphin
+usam e o que o README deste fork planeja reusar do rpPS4. Porém, nesta fase:
+
+1. **Escopo:** o interpretador atual suporta ≈200 mnemônicos (ALU completo, SSE/AVX scalar,
+   BMI1/BMI2, ABM). Um emissor ARM64 correto exige levantamento de flags por instrução,
+   emulação de EFLAGS lazy, tratamento de cada modo de endereçamento, e um cache de código
+   com invalidação SMC correta sob W^X.
+2. **Risco:** um dynarec parcial entregaria *corrupção silenciosa de estado* — a classe de bug
+   mais cara que existe em emulação. O valor de estabilidade do projeto seria destruído.
+3. **Viabilidade:** o backend planejado deve vir do rpPS4 ( decisão já registrada no README);
+   reimplementá-lo do zero aqui duplicaria esforço com qualidade inferior.
+4. **Evidência de maturidade:** o jogo-alvo (*Dreaming Sarah*) nem completa o boot ainda;
+   o gargalo imediato é *conseguir executar mais rápido e com diagnósticos fiéis*, não pico
+   absoluto de desempenho.
+
+### 2.2 Por que não threaded interpretation (opção C)
+
+Em C/C++ o threaded dispatch (computed goto) reduz o custo do `switch`. Em C# gerenciado,
+o `switch` do JIT já compila para jump table; o ganho restante é pequeno comparado ao custo
+de decodificação/validação que a opção B elimina, e a implementação (tabelas de
+delegates por opcode → indireção de vtable em Mono) pode até *piorar* o desempenho no
+Mono do Android.
+
+---
+
+## 3. Decisão
+
+> **Implementar a opção B — interpretador com cache de blocos básicos pré-decodificados
+> ("cached interpreter") — como o modo de execução padrão em todos os hosts (desktop e
+> Android), estruturando o cache de blocos como fundação direta do futuro JIT recompiler
+> (opção D).**
+
+### 3.1 O que foi implementado
+
+- **`X64BlockCache.cs`** (`src/SharpEmu.Core/Cpu/Interpreter/`): cache de blocos básicos
+  por thread (o backend é instanciado por thread convidada — sem necessidade de locks).
+  Um bloco é uma sequência reta de instruções terminada por instrução de controle de fluxo
+  (`FlowControl != Next`), por limite de tamanho, ou por endereçar um stub de importação.
+- **Loop de execução** (`X64InterpreterBackend.Execute`): caminho rápido por bloco —
+  1 consulta de dicionário de stubs e 1 validação de SMC **por bloco** em vez de por
+  instrução; o caminho legado instrução-a-instrução permanece intacto como fallback
+  universal (falha de decodificação, bloco não construído, etc.), garantindo paridade
+  semântica total para todos os casos de borda.
+- **Validação SMC (self-modifying code):** mesma política do cache por instrução, em
+  granularidade de bloco — blocos em regiões não-graváveis confiam na `MappingGeneration`
+  (invalidação conservadora global); blocos em regiões graváveis revalidam o intervalo de
+  bytes completo a cada execução. Um bloco que cruza regiões usa a política mais
+  conservadora (validação por bytes).
+- **Preservação estrita de semântica observável:** contagem de instruções (`MaxInstructions`
+  e `TotalInstructions`), conteúdo do trace, anel de instruções recentes (`PushRecent`),
+  diagnósticos de falha (`MemoryFault`/`Trap`/`NotImplemented` com o RIP e bytes da
+  instrução exata), e a ordem stub→bloco→execução são idênticos ao caminho legado.
+- **Opção de runtime:** `CpuExecutionOptions.InterpreterBlockCacheEnabled` (padrão:
+  **ativado**), propagada por `CpuDispatcher` → `X64InterpreterOptions.EnableBlockCache`,
+  com flag CLI `--cpu-no-block-cache` para A/B e diagnóstico.
+
+### 3.2 Por que esta é a melhor estratégia a longo prazo
+
+1. **Desempenho imediato e mensurável:** o custo dominante por instrução (decodificação
+   Iced + hash + releitura de bytes + probe de dicionário) cai para O(1) por *bloco*.
+   Loops quentes (o caso dominante em código de jogos) passam a executar com uma única
+   validação de intervalo por iteração. Benchmark incluído na suíte de testes
+   (`BlockCache_ThroughputSmokeBenchmark`, loop de 3 instruções × 200k iterações):
+   **2,65× mais rápido** no desktop RyuJIT — no Mono JIT do Android, onde o custo por
+   instrução interpretada é maior, o ganho relativo tende a ser ainda maior.
+2. **Estabilidade:** a execução continua usando **os mesmos handlers** já validados pelos
+   ~2.100 linhas de testes existentes do interpretador; não há tradução de código — apenas
+   *reuso* de decodificação. Paridade de comportamento é testada (testes de paridade
+   cache ligado/desligado).
+3. **Fundação do recompilador:** o cache de blocos é, estruturalmente, o esqueleto do
+   futuro cache de tradução: mesma chave (RIP + geração de mapeamento), mesma política de
+   invalidação SMC, mesmos pontos de entrada/saída de blocos. A Fase 2 (IR leve por bloco)
+   e a Fase 3 (emissor ARM64 + W^X flip + `FlushInstructionCache`) plugam **no nível do
+   bloco**, substituindo "executar instruções interpretadas do bloco" por "executar código
+   ARM64 do bloco" — sem redesenho.
+4. **Manutenção:** um único caminho de semântica (handlers compartilhados entre o modo
+   legado e o modo cacheado) elimina a classe inteira de divergências "funciona no modo X,
+   quebra no modo Y".
+
+### 3.3 Roadmap para o JIT recompiler (opção D)
+
+| Fase | Escopo | Dependência |
+|---|---|---|
+| **2** | IR leve por bloco (operadores já normalizados a partir das instruções Iced) | Este cache de blocos |
+| **3** | Emissor ARM64 do IR + cache de código RWX→RX (W^X flip) + `FlushInstructionCache` | Fase 2; referência: dynarec do rpPS4/shadPS4 |
+| **4** | Linking direto de blocos (patch de saídas de blocos para entradas diretas), flags lazy | Fase 3 |
+| **5** | Trampolinos HLE nativos (substituir retorno ao host em cada stub por salto direto) | Fase 3 |
+
+O caminho legado (interpretador instrução-a-instrução) permanece como fallback permanente
+e como oráculo de referência para testes de paridade do recompilador.
+
+---
+
+## 4. Consequências
+
+**Positivas**
+- Ganho de desempenho imediato em Android (Mono JIT) e desktop, sem risco de corrupção de
+  estado convidado.
+- Diagnósticos e testes existentes continuam válidos; novos testes de paridade travam o
+  comportamento.
+- Caminho de migração claro e incremental para o dynarec ARM64.
+
+**Negativas / custos**
+- Memória adicional por thread para os blocos (proporcional ao conjunto de trabalho quente;
+  blocos em regiões não-graváveis têm vida longa, idêntica ao cache de decodificação atual).
+- Dois caminhos de execução no mesmo arquivo (rápido por bloco + legado por instrução),
+  mitigado por testes de paridade obrigatórios em cada mudança.
+
+## 5. Referências
+
+- `src/SharpEmu.Core/Cpu/Interpreter/X64InterpreterBackend.cs` — loop original e cache por instrução
+- `src/SharpEmu.Core/Cpu/Interpreter/X64BlockCache.cs` — cache de blocos (implementação desta decisão)
+- `src/SharpEmu.Core/Cpu/CpuDispatcher.cs` — seleção de backend e guarda Android
+- `src/SharpEmu.HLE/ICpuMemory.cs` — contrato `MappingGeneration`/`TryIsRegionNonWritable` (guarda SMC)
+- `platform/android` e `src/SharpEmu.Android` — host Android (SDL3 + .NET Android)

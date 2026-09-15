@@ -24,6 +24,16 @@ public readonly struct CpuExecutionOptions
 
     public int EffectiveInterpreterMaxInstructions => InterpreterMaxInstructions;
 
+    /// <summary>
+    /// Disables the x64 interpreter's basic-block decode cache (see X64BlockCache), forcing
+    /// the legacy per-instruction decode path. Inverted naming on purpose: with a plain
+    /// "enabled" bool, <c>default(CpuExecutionOptions)</c> would silently turn the cache off,
+    /// while a "disabled" flag keeps unset/default options on the fast path. Semantics are
+    /// unchanged either way (same execution handlers; the per-instruction path remains as
+    /// fallback); the CLI's <c>--cpu-no-block-cache</c> flag sets this for A/B comparisons.
+    /// </summary>
+    public bool InterpreterBlockCacheDisabled { get; init; }
+
     public bool StrictDynlibResolution { get; init; }
 
     public int ImportTraceLimit { get; init; }
