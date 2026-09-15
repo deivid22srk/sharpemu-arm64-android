@@ -6,13 +6,13 @@
 - **Status:** Aceita e implementada (Fase 1)
 - **Data:** 2026-09-15
 - **Decisores:** Port SharpEmu ARM64 (fork não oficial)
-- **Escopo:** Backend de execução da CPU convidada (x86-64 do PS4) em hosts Android ARM64
+- **Escopo:** Backend de execução da CPU convidada (x86-64 do PS5) em hosts Android ARM64
 
 ---
 
 ## 1. Contexto
 
-O SharpEmu emula o PS4, cuja CPU convidada é **x86-64** (AMD Jaguar). O alvo deste fork é
+O SharpEmu emula o PS5, cuja CPU convidada é **x86-64** (AMD Zen 2, 8 núcleos). O alvo deste fork é
 **Android ARM64**, onde o código convidado não pode ser executado nativamente — toda instrução
 x86-64 precisa ser interpretada ou traduzida para ARM64.
 
@@ -65,6 +65,7 @@ A implementação atual no caminho Android é um **interpretador instrução-a-i
 | **B.** Interpretador otimizado com **cache de blocos básicos pré-decodificados** ("cached/block interpreter") | Alto (elimina re-decodificação, hash, probe de dicionário e guarda de SMC por instrução → 1× por bloco) | Moderada (~400 linhas, sem mudança semântica) | **Baixo** (mesmos handlers de execução; semântica idêntica por construção) | Baixa |
 | **C.** Threaded interpretation (despacho direto a handlers, estilo computed goto) | Médio | Alta em C# puro (sem `goto computed`; exigiria gerar tabela de delegates ou codegen IL) | Médio | Média |
 | **D.** JIT recompiler x86-64→ARM64 (dynarec completo) | Muito alto (10–50× sobre interpretador) | **Extrema** (≈200 mnemônicos, flags parciais lazy, SMC, W^X, sinais/exceções, trampolinos HLE) | **Alto** sem anos de testes | Alta |
+| **E.** Reaproveitar um dynarec externo pronto (**box64**) como backend de execução | Alto em CPU crua (dynarec maduro, ~70–85% do nativo em código não-exótico) | **Inviável na integração** com a arquitetura HLE deste projeto (ver §2.3) | Inviável | — |
 
 ### 2.1 Por que não o recompilador JIT agora (opção D)
 
@@ -90,6 +91,41 @@ o `switch` do JIT já compila para jump table; o ganho restante é pequeno compa
 de decodificação/validação que a opção B elimina, e a implementação (tabelas de
 delegates por opcode → indireção de vtable em Mono) pode até *piorar* o desempenho no
 Mono do Android.
+
+### 2.3 Por que não box64 (opção E)
+
+O [box64](https://github.com/ptitSeb/box64) (MIT) é um dynarec x86_64→ARM64 maduro — e a
+ideia de "não escrever um recompilador, reaproveitar um pronto" é atraente à primeira vista.
+A rejeição é **arquitetural, não de qualidade**: o box64 é um *emulador de processo inteiro*
+("Linux Userspace x86_64 Emulator") — ele carrega o ELF x86-64, monta seu próprio espaço de
+endereçamento, instala seus tratadores de sinais, provê TLS e um modelo de threads próprios.
+O SharpEmu precisa do controle exatamente oposto:
+
+1. **Dono do processo invertido:** aqui o emulador possui o processo e dirige cada thread
+   convidada individualmente (contextos de CPU por thread, agendamento pelo kernel emulado,
+   falhas de página roteadas para a GPU/memória, SMC via `MappingGeneration`, stubs HLE
+   interceptados por RIP, debugger e anel de diagnósticos). Embutir o box64 exigiria que ele
+   fosse o dono do espaço de endereçamento — conflito direto com o rastreador de memória
+   gerenciado que sustenta HLE, SMC e faults.
+2. **O convidado não é um ELF Linux:** um jogo de PS5 é um ELF Orbis com módulos `.sprx`,
+   TLS SCE e syscalls do kernel Orbis. Todo o HLE (VideoOut, AGC, AJM/ACM, GNM, kevents)
+   vive em C# integrado à memória gerenciada. Com box64, cada serviço teria que virar uma
+   "wrapped library" nativa em C e o loader Orbis teria que ser reimplementado dentro do
+   loader do box64 — meses de cola nativa para descartar o core C# (a parte que funciona).
+3. **Android packaging:** box64 no Android exige um userspace glibc (proot/Termux ou ponte
+   nativa estilo Winlator) — dezenas de MB, fragilidade por device, e um segundo runtime
+   convivendo com o app .NET.
+4. **Evidência empírica:** o modelo box64 encaixa de verdade na arquitetura do
+   Kyty/KytyPS5 — emulador x86-64 que executa o código convidado *nativamente* (por isso
+   precisa de Rosetta 2 no Apple Silicon) — e lá o box64 é a única forma de chegar ao
+   ARM64: ele traduz o próprio emulador **e** o jogo. É exatamente o modelo do
+   KytyPS5-Android, cujo estado ("nenhum jogo funcionando ainda") ilustra o custo dessa
+   forma: tradução em duas camadas + ambiente glibc-on-bionic + emulador upstream
+   early-stage, tudo acumulado antes do primeiro frame. Ferramenta certa, arquitetura
+   errada para este projeto.
+5. **O que se aproveita mesmo assim:** o box64 permanece referência de design para as
+   Fases 3–5 (detecção de hot blocks, heurísticas de SMC por página, modos strong/weak
+   memory, estratégias de block linking).
 
 ---
 
