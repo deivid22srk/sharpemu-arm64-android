@@ -52,10 +52,10 @@ jobs:
         shell: bash
         run: chmod +x platform/android/gradlew
 
-      - name: Build Kotlin/Compose library (.aar) - Debug
+      - name: Build Kotlin/Compose library (.aar)
         working-directory: platform/android
         shell: bash
-        run: ./gradlew :app:assembleDebug
+        run: ./gradlew :app:assembleRelease
 
       - name: Clean .NET Android build outputs
         shell: bash
