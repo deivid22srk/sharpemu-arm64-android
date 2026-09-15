@@ -191,7 +191,19 @@ public static class VideoOutExports
         HostSessionControl.RequestShutdown(reason);
         GuestGpu.Current.RequestClose();
 
-        // Give guest and GPU threads a bounded window to leave cooperatively.
+        // Give guest and GPU threads a bounded window to leave cooperatively. The bounded
+        // hard exit is a DESKTOP-only safety net: the CLI process has nothing else to live
+        // for once the guest stops. On Android this runs inside the app's own process (the
+        // Kotlin/Compose library UI and every Activity live in it too), where an unconditional
+        // Environment.Exit(0) would kill the whole app — including Activity recreations the
+        // system legitimately performs — instead of letting GameActivity.Main() unwind
+        // naturally through the same cooperative flags above. The flags are the actual
+        // shutdown mechanism; the exit below only guarantees desktop CLI termination.
+        if (OperatingSystem.IsAndroid())
+        {
+            return;
+        }
+
         ThreadPool.QueueUserWorkItem(static _ =>
         {
             Thread.Sleep(2000);

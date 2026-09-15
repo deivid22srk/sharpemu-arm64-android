@@ -274,12 +274,44 @@ public sealed class X64InterpreterBlockCacheTests
     }
 
     [Fact]
-    public void BlockCache_TrustsNonWritableRegionsUntilMappingGenerationChanges()
+    public void BlockCache_IntraBlockSelfModifyingCodeExecutesPatchedInstruction()
+    {
+        // inst0 @+0 : mov dword ptr [rip+1], 0x2A   (C7 05 01 00 00 00 2A 00 00 00) — 10 bytes;
+        //             writes to CodeBase+11, which is the immediate of inst1 below.
+        // inst1 @+10: mov eax, 0x11111111           (B8 11 11 11 11) — patched to 0x2A by inst0.
+        // inst2 @+15: ret
+        // A pre-decoded block would run inst1 with its STALE immediate; the legacy path decodes
+        // inst1 from the patched bytes and must see 0x2A. The cached path revalidates the block
+        // after the store, drops it, and single-steps the patched instruction — same result.
+        var code = new byte[16];
+        code[0] = 0xC7; code[1] = 0x05;
+        WriteInt32(code, 2, 1);           // rip-relative disp: target CodeBase+11 - (CodeBase+10)
+        WriteInt32(code, 6, 0x2A);        // store immediate
+        code[10] = 0xB8;                  // mov eax, imm32
+        WriteInt32(code, 11, 0x1111_1111);
+        code[15] = 0xC3;
+
+        var memory = new VirtualMemory();
+        memory.Map(CodeBase, 0x1000, 0, code, ProgramHeaderFlags.Read | ProgramHeaderFlags.Write | ProgramHeaderFlags.Execute);
+        memory.Map(StackBase, StackSize, 0, ReadOnlySpan<byte>.Empty, ProgramHeaderFlags.Read | ProgramHeaderFlags.Write);
+        var context = new CpuContext(memory, Generation.Gen5) { Rip = CodeBase, Rflags = 0x202 };
+        context[CpuRegister.Rsp] = StackBase + StackSize;
+        Assert.True(context.PushUInt64(0));
+
+        var backend = new X64InterpreterBackend(new ModuleManager());
+        var result = backend.Execute(context, CodeBase, new Dictionary<ulong, string>(), new X64InterpreterOptions { MaxInstructions = 1000 });
+
+        Assert.Equal(OrbisGen2Result.ORBIS_GEN2_OK, result.Result);
+        Assert.Equal(0x2AUL, context[CpuRegister.Rax]);
+    }
+
+    [Fact]
+    public void BlockCache_WritableRegionsValidateEveryExecution()
     {
         // VirtualMemory does not implement TryIsRegionNonWritable/MappingGeneration (interface
         // defaults), so this test verifies the FALLBACK contract: writable-validated blocks
         // still execute correctly across re-runs of the same backend. The generation-based
-        // fast path is exercised on-device via PhysicalVirtualMemory (which implements both).
+        // trust path has its own dedicated tests below (GenerationTrackingMemory).
         var code = new byte[] { 0x48, 0xFF, 0xC0, 0xC3 }; // inc rax; ret
         var backend = new X64InterpreterBackend(new ModuleManager());
         var options = new X64InterpreterOptions { MaxInstructions = 1000 };
@@ -293,39 +325,282 @@ public sealed class X64InterpreterBlockCacheTests
         }
     }
 
-    // ------------------------------------------------------------------ throughput smoke
+    // ------------------------------------------------------------------ throughput
 
     [Fact]
-    public void BlockCache_ThroughputSmokeBenchmark()
+    public void BlockCache_ThroughputBenchmark()
     {
-        // add rax, 1; dec rcx; jnz -5 — one 3-instruction block looped N times.
+        // Loop body = 8 straight-line adds + dec + jnz (10 instructions per block) — a
+        // representative straight-line-heavy shape: the cached path pays one block validation
+        // per iteration where the legacy path pays one per-instruction decode-cache validation
+        // per instruction, on top of identical handler work.
+        var code = new List<byte>
+        {
+            0x48, 0xC7, 0xC1, 0xA0, 0x86, 0x01, 0x00, // mov rcx, 100000
+        };
+        for (var i = 0; i < 8; i++)
+        {
+            code.AddRange([0x48, 0xFF, 0xC0]); // add rax, 1
+        }
+
+        code.AddRange([0x48, 0xFF, 0xC9]);         // dec rcx  (loop:)
+        // jnz rel8 back to the first add (offset 7): rip after jnz = 36, rel8 = 7 - 36 = -29.
+        code.AddRange([0x75, 0xE3]);
+        code.Add(0xC3);                            // ret
+        const int iterations = 100_000;
+        // 1 (mov) + 10 per iteration + 1 (ret), plus headroom (see budget note below).
+        var budget = 2 + iterations * 10 + 100;
+
+        double RunPath(bool enableBlockCache)
+        {
+            var run = Execute(CreateContext([.. code]), enableBlockCache: enableBlockCache, options: new X64InterpreterOptions { MaxInstructions = budget });
+            Assert.Equal(CpuExitReason.ReturnedToHost, run.Result.Reason);
+            Assert.Equal((ulong)(8 * iterations), run.Context[CpuRegister.Rax]);
+            return run.Stopwatch.ElapsedTicks;
+        }
+
+        // Warm both code paths first (JIT tiering + cache fill must not be measured), then
+        // alternate runs and take medians, so neither path gets a systematic first/faster-order
+        // advantage. No timing assertion beyond a conservative sanity floor — CI variance makes
+        // tight timing assertions flaky.
+        RunPath(enableBlockCache: false);
+        RunPath(enableBlockCache: true);
+
+        const int rounds = 5;
+        var legacyTicks = new List<double>(rounds);
+        var cachedTicks = new List<double>(rounds);
+        for (var round = 0; round < rounds; round++)
+        {
+            legacyTicks.Add(RunPath(enableBlockCache: false));
+            cachedTicks.Add(RunPath(enableBlockCache: true));
+        }
+
+        legacyTicks.Sort();
+        cachedTicks.Sort();
+        var legacyMedian = legacyTicks[rounds / 2];
+        var cachedMedian = cachedTicks[rounds / 2];
+        var speedup = legacyMedian / Math.Max(1, cachedMedian);
+        _output.WriteLine(
+            $"block-cache benchmark (median of {rounds}, 10-instruction block): " +
+            $"legacy={legacyMedian:F0} ticks, cached={cachedMedian:F0} ticks, speedup={speedup:F2}x");
+
+        Assert.True(legacyMedian > 0 && cachedMedian > 0);
+    }
+
+    // ------------------------------------------------------------------ invariant
+
+    [Fact]
+    public void BlockCache_SizeCapKeepsTwoPageWritabilityInvariant()
+    {
+        // TryBuildBlock classifies a block as non-writable by checking ONLY its two endpoints.
+        // That is sound while a block spans at most two pages (its endpoints then cover every
+        // page the block touches); this test pins the invariant so raising the size cap cannot
+        // silently break it. Keep these in sync with X64InterpreterBackend's consts.
+        Assert.True(X64InterpreterBackend.MaxBlockBytes <= 2 * 4096,
+            $"MaxBlockBytes ({X64InterpreterBackend.MaxBlockBytes}) must not exceed two pages; " +
+            "the both-ends writability check in TryBuildBlock assumes it.");
+    }
+
+    [Fact]
+    public void BlockCache_TrustPathSkipsByteValidationWhileGenerationIsStable()
+    {
+        var code = new byte[] { 0x48, 0xFF, 0xC0, 0xC3 }; // inc rax; ret
+        var memory = new GenerationTrackingMemory();
+        memory.Map(CodeBase, 0x1000, code);
+        memory.Map(StackBase, StackSize);
+        memory.MarkNonWritable(CodeBase, 0x1000);
+
+        var backend = new X64InterpreterBackend(new ModuleManager());
+        var options = new X64InterpreterOptions { MaxInstructions = 1000 };
+
+        // Round 1: cold — block is built and validated by bytes (code reads happen).
+        var firstContext = CreateContext(memory);
+        var first = backend.Execute(firstContext, CodeBase, new Dictionary<ulong, string>(), options);
+        Assert.Equal(OrbisGen2Result.ORBIS_GEN2_OK, first.Result);
+        Assert.True(memory.CodeTryReadCallCount > 0);
+        var readsAfterColdRun = memory.CodeTryReadCallCount;
+
+        // Round 2: warm — the block is trusted (non-writable + generation unchanged), so the
+        // dispatch path must NOT re-read/validate the code bytes at all. (Only code-region
+        // reads are counted — stack/data reads belong to instruction execution, not decoding.)
+        var secondContext = CreateContext(memory);
+        var second = backend.Execute(secondContext, CodeBase, new Dictionary<ulong, string>(), options);
+        Assert.Equal(OrbisGen2Result.ORBIS_GEN2_OK, second.Result);
+        Assert.Equal(1UL, secondContext[CpuRegister.Rax]);
+        Assert.Equal(readsAfterColdRun, memory.CodeTryReadCallCount);
+
+        // Round 3: after a generation bump (a structural remap anywhere), the trust fast path
+        // must be dropped and the block revalidated by bytes exactly once, then trusted again.
+        memory.BumpGeneration();
+        var thirdContext = CreateContext(memory);
+        var third = backend.Execute(thirdContext, CodeBase, new Dictionary<ulong, string>(), options);
+        Assert.Equal(OrbisGen2Result.ORBIS_GEN2_OK, third.Result);
+        Assert.Equal(1UL, thirdContext[CpuRegister.Rax]);
+        Assert.Equal(readsAfterColdRun + 1, memory.CodeTryReadCallCount);
+
+        var fourthContext = CreateContext(memory);
+        var fourth = backend.Execute(fourthContext, CodeBase, new Dictionary<ulong, string>(), options);
+        Assert.Equal(OrbisGen2Result.ORBIS_GEN2_OK, fourth.Result);
+        Assert.Equal(1UL, fourthContext[CpuRegister.Rax]);
+        Assert.Equal(readsAfterColdRun + 1, memory.CodeTryReadCallCount);
+    }
+
+    [Fact]
+    public void BlockCache_TrustPathFollowsRegionThatBecameWritable()
+    {
+        var code = new byte[] { 0xB8, 0x01, 0x00, 0x00, 0x00, 0xC3 }; // mov eax, 1; ret
+        var memory = new GenerationTrackingMemory();
+        memory.Map(CodeBase, 0x1000, code);
+        memory.Map(StackBase, StackSize);
+        memory.MarkNonWritable(CodeBase, 0x1000);
+
+        var backend = new X64InterpreterBackend(new ModuleManager());
+        var options = new X64InterpreterOptions { MaxInstructions = 1000 };
+
+        var firstContext = CreateContext(memory);
+        var first = backend.Execute(firstContext, CodeBase, new Dictionary<ulong, string>(), options);
+        Assert.Equal(OrbisGen2Result.ORBIS_GEN2_OK, first.Result);
+        Assert.Equal(1UL, firstContext[CpuRegister.Rax]);
+
+        // The region is reprotected writable AND its bytes change — a generation bump is what
+        // makes the trusted entry invalid; the byte-range validation must then see the new code.
+        memory.MarkWritable(CodeBase, 0x1000);
+        memory.BumpGeneration();
+        Assert.True(memory.TryWrite(CodeBase, [0xB8, 0x2A, 0x00, 0x00, 0x00, 0xC3]));
+
+        var secondContext = CreateContext(memory);
+        var second = backend.Execute(secondContext, CodeBase, new Dictionary<ulong, string>(), options);
+        Assert.Equal(OrbisGen2Result.ORBIS_GEN2_OK, second.Result);
+        Assert.Equal(0x2AUL, secondContext[CpuRegister.Rax]);
+    }
+
+    // ------------------------------------------------------------------ stub boundary edges
+
+    [Fact]
+    public void BlockCache_Parity_FallThroughIntoImportStub()
+    {
+        // Two nops then fall through straight into the stub address: the block builder must
+        // end the block BEFORE the stub, and the dispatcher must handle it like any stub entry.
+        // AssertParity runs the program once per cache mode, so the stub dispatches exactly
+        // twice (once for the cached run, once for the legacy run).
+        var importStubs = new Dictionary<ulong, string> { [CodeBase + 2] = "nop_export" };
+        var dispatchCount = 0;
+        AssertParity(
+            [0x90, 0x90],
+            importStubs: importStubs,
+            moduleManager: new CallbackModuleManager((_, _) => dispatchCount++),
+            assertFinal: _ => Assert.Equal(2, dispatchCount));
+    }
+
+    [Fact]
+    public void BlockCache_Parity_ConditionalBranchIntoImportStub()
+    {
+        // xor rax, rax; jz rel32 stub; ud2 — the taken jcc ends a block and enters the stub.
+        // rel8 cannot reach StubAddress from CodeBase, hence the rel32 encoding (0F 84).
+        var code = new byte[0x10];
+        code[0] = 0x48; code[1] = 0x31; code[2] = 0xC0; // xor rax, rax
+        code[3] = 0x0F; code[4] = 0x84;                 // jz rel32 (rip after = CodeBase+9)
+        WriteInt32(code, 5, unchecked((int)(StubAddress - (CodeBase + 9))));
+        code[9] = 0x0F; code[10] = 0x0B;                // ud2 (must never run)
+
+        var importStubs = new Dictionary<ulong, string> { [StubAddress] = "jcc_export" };
+        var dispatchCount = 0;
+        AssertParity(
+            code,
+            importStubs: importStubs,
+            moduleManager: new CallbackModuleManager((_, _) => dispatchCount++),
+            assertFinal: _ => Assert.Equal(2, dispatchCount));
+    }
+
+    [Fact]
+    public void BlockCache_Parity_RunLongerThanOneBlockSplitsCleanly()
+    {
+        // 80 nops (longer than the 64-instruction block cap) + mov eax, 42 + ret — exercises
+        // the split path where a block ends at the size cap and the next block starts at the
+        // fall-through RIP.
+        var code = new List<byte>(84);
+        for (var i = 0; i < 80; i++)
+        {
+            code.Add(0x90);
+        }
+
+        code.AddRange([0xB8, 0x2A, 0x00, 0x00, 0x00, 0xC3]);
+        AssertParity([.. code], assertFinal: context => Assert.Equal(42UL, context[CpuRegister.Rax]));
+    }
+
+    [Fact]
+    public void BlockCache_Parity_TraceTextIsIdentical()
+    {
         var code = new byte[]
         {
-            0x48, 0xC7, 0xC1, 0x40, 0x0D, 0x03, 0x00, // mov rcx, 200000
-            0x48, 0xFF, 0xC0,                          // add rax, 1  (loop:)
-            0x48, 0xFF, 0xC9,                          // dec rcx
-            0x75, 0xF9,                                // jnz loop
-            0xC3,
+            0xB8, 0x05, 0x00, 0x00, 0x00, // mov eax, 5
+            0x83, 0xC0, 0x07,             // add eax, 7
+            0xC3,                         // ret
         };
-        const int iterations = 200_000;
-        // Program length: 1 (mov rcx) + 3 per iteration + 1 (ret) — plus headroom so both
-        // paths run to completion (a budget exactly equal to the program length still exits
-        // with BudgetExceeded, since the budget is checked before the final dispatch).
-        var budget = iterations * 3 + 2 + 100;
 
-        var legacy = Execute(CreateContext(code), enableBlockCache: false, options: new X64InterpreterOptions { MaxInstructions = budget });
-        var legacyTicks = legacy.Stopwatch.ElapsedTicks;
+        var cachedContext = CreateContext(code);
+        var legacyContext = CreateContext(code);
+        var options = new X64InterpreterOptions { MaxInstructions = 1000, Trace = true };
+        var cached = Execute(cachedContext, enableBlockCache: true, options: options);
+        var legacy = Execute(legacyContext, enableBlockCache: false, options: options);
 
-        var cached = Execute(CreateContext(code), enableBlockCache: true, options: new X64InterpreterOptions { MaxInstructions = budget });
-        var cachedTicks = cached.Stopwatch.ElapsedTicks;
+        AssertResultsEqual(legacy.Result, cached.Result);
+        Assert.NotNull(cached.Result.Trace);
+        Assert.Equal(legacy.Result.Trace, cached.Result.Trace);
+    }
 
-        Assert.Equal(CpuExitReason.ReturnedToHost, cached.Result.Reason);
-        Assert.Equal(iterations, (int)cached.Context[CpuRegister.Rax]);
-        Assert.Equal(legacy.Result.TotalInstructions, cached.Result.TotalInstructions);
-        Assert.Equal(legacy.Context[CpuRegister.Rax], cached.Context[CpuRegister.Rax]);
+    private static CpuContext CreateContext(GenerationTrackingMemory memory)
+    {
+        var context = new CpuContext(memory, Generation.Gen5)
+        {
+            Rip = CodeBase,
+            Rflags = 0x202,
+        };
+        context[CpuRegister.Rsp] = StackBase + StackSize;
+        Assert.True(context.PushUInt64(0));
+        return context;
+    }
 
-        var speedup = (double)legacyTicks / Math.Max(1, cachedTicks);
-        _output.WriteLine($"block-cache smoke benchmark: legacy={legacyTicks} ticks, cached={cachedTicks} ticks, speedup={speedup:F2}x");
+    /// <summary>
+    /// VirtualMemory wrapper implementing the SMC trust contract (MappingGeneration +
+    /// TryIsRegionNonWritable) with an observable code-region read counter, so the block
+    /// cache's generation-based fast path can be tested deterministically instead of only
+    /// on-device. Only reads inside the code region are counted — stack/data reads belong to
+    /// instruction execution, not to decode/validation.
+    /// </summary>
+    private sealed class GenerationTrackingMemory : ICpuMemory
+    {
+        private readonly VirtualMemory _inner = new();
+        private readonly List<(ulong Start, ulong Length)> _nonWritableRanges = [];
+
+        public int CodeTryReadCallCount;
+
+        public long MappingGeneration { get; private set; }
+
+        public void BumpGeneration() => MappingGeneration++;
+
+        public void Map(ulong address, ulong length, byte[]? data = null) =>
+            _inner.Map(address, length, 0, data is null ? ReadOnlySpan<byte>.Empty : data, ProgramHeaderFlags.Read | ProgramHeaderFlags.Write | ProgramHeaderFlags.Execute);
+
+        public void MarkNonWritable(ulong address, ulong length) => _nonWritableRanges.Add((address, length));
+
+        public void MarkWritable(ulong address, ulong length) =>
+            _nonWritableRanges.RemoveAll(r => r.Start <= address && address < r.Start + r.Length);
+
+        public bool TryIsRegionNonWritable(ulong address) =>
+            _nonWritableRanges.Any(r => r.Start <= address && address < r.Start + r.Length);
+
+        public bool TryRead(ulong virtualAddress, Span<byte> destination)
+        {
+            if (virtualAddress >= CodeBase && virtualAddress < CodeBase + 0x1000)
+            {
+                Interlocked.Increment(ref CodeTryReadCallCount);
+            }
+
+            return _inner.TryRead(virtualAddress, destination);
+        }
+
+        public bool TryWrite(ulong virtualAddress, ReadOnlySpan<byte> source) => _inner.TryWrite(virtualAddress, source);
     }
 
     // ------------------------------------------------------------------ shared harness
@@ -389,6 +664,10 @@ public sealed class X64InterpreterBlockCacheTests
         Assert.Equal(legacy.TrapInfo, cached.TrapInfo);
         Assert.Equal(legacy.MemoryFaultInfo, cached.MemoryFaultInfo);
         Assert.Equal(legacy.NotImplementedInfo, cached.NotImplementedInfo);
+        if (legacy.Trace is not null && cached.Trace is not null)
+        {
+            Assert.Equal(legacy.Trace, cached.Trace);
+        }
     }
 
     private static (X64InterpreterResult Result, CpuContext Context, Stopwatch Stopwatch) Execute(

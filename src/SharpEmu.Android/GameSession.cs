@@ -89,10 +89,10 @@ internal static class GameSession
     {
         // Same cooperative shutdown the desktop CLI's Ctrl+C handler uses (Program.cs calls
         // VideoOutExports.NotifyHostInterrupt on SIGINT): it flips VideoOut's vblank loop stop
-        // flag, requests the host session shutdown, asks the guest GPU backend to close, and
-        // gives guest/GPU threads a bounded window to leave before the process tears down —
-        // so "back out of the game" from the Android UI ends the run cleanly instead of only
-        // killing the Activity.
+        // flag, requests the host session shutdown, and asks the guest GPU backend to close,
+        // so the interpreter loop and SDL thread unwind naturally and GameActivity.Main()
+        // returns — the run ends cleanly and the app process (library UI, Activities) stays
+        // alive. RequestHostShutdown's bounded Environment.Exit hard-exit is desktop-only.
         VideoOutExports.NotifyHostInterrupt();
     }
 

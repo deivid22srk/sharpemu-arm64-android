@@ -41,13 +41,27 @@ This proof of concept currently uses an **adapted interpreter created mainly to 
 
 The guest CPU backend now executes hot code through a **basic-block decode cache**
 ("cached interpreter") — blocks are decoded once with Iced and validated as one contiguous
-byte range per execution, instead of re-decoding every instruction every time it runs
-(see `src/SharpEmu.Core/Cpu/Interpreter/X64BlockCache.cs` and
-[`ARCHITECTURE_DECISION.md`](./ARCHITECTURE_DECISION.md) for the full rationale and the
-measured 2.65x desktop speedup). Guest-visible semantics are unchanged — the legacy
-per-instruction path remains as the universal fallback and is kept byte-identical by
-parity tests (`X64InterpreterBlockCacheTests`), and it stays as the foundation for the
-planned ARM64 JIT recompiler (phases 2-5 in the decision document).
+byte range per execution (plus revalidation after every memory-writing instruction, which
+closes the intra-block self-modifying-code window a pre-decoded block would otherwise
+open), instead of re-validating every instruction every time it runs. See
+`src/SharpEmu.Core/Cpu/Interpreter/X64BlockCache.cs` and
+[`ARCHITECTURE_DECISION.md`](./ARCHITECTURE_DECISION.md).
+
+Measured honestly (benchmark in the test suite, median of 5 warmed alternating runs):
+**1.45x** on straight-line-heavy code (10-instruction blocks); ~parity on 3-instruction
+micro-loops, where the legacy per-instruction decode cache already hits and identical
+handler work dominates. The larger wins are structural: the legacy cache is direct-mapped
+(65,536 slots) and re-decodes on collisions that an exact-key block dictionary eliminates,
+stub-dictionary probes drop from per-instruction to per-block, and per-instruction
+dispatch overhead matters more on Android's Mono JIT. The block cache is also the
+foundation for the planned ARM64 JIT recompiler (phases 2-5 in the decision document):
+same cache key (RIP + mapping generation), same SMC invalidation contract, same block
+boundaries a translating backend would use.
+
+Guest-visible semantics are unchanged: the legacy per-instruction path remains wired in as
+the universal fallback and is kept identical by parity tests
+(`X64InterpreterBlockCacheTests` — 20+ tests comparing registers, flags, memory, instruction
+accounting, trace text, and diagnostics between cache modes, including intra-block SMC).
 
 This is also the long-term execution strategy decision for the Android/ARM64 port:
 cached interpreter now, JIT recompiler later on top of the same block infrastructure.
