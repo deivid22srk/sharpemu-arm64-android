@@ -70,8 +70,15 @@ jobs:
         shell: bash
         run: rm -rf artifacts/obj/SharpEmu.Android artifacts/bin/Debug/net10.0-android
 
+      # EmbedAssembliesIntoApk: Debug builds default to Fast Deployment, which leaves the .NET
+      # assemblies OUT of the APK (they are expected to be adb-pushed into files/.__override__/
+      # <abi>) — a debug APK installed outside `adb deploy` (the whole point of this artifact)
+      # then aborts at startup with "No assemblies found ... Assuming this is part of Fast
+      # Deployment. Exiting...". Force embedding so the artifact is a self-contained installable
+      # APK. The app project now forces the same in Debug; passing it here documents and locks
+      # it at the CI level so the workflow cannot silently regress.
       - name: Build Android APK (Debug)
-        run: dotnet build src/SharpEmu.Android/SharpEmu.Android.csproj -c Debug -f net10.0-android
+        run: dotnet build src/SharpEmu.Android/SharpEmu.Android.csproj -c Debug -f net10.0-android -p:EmbedAssembliesIntoApk=true
 
       - name: Rename APK artifact
         shell: bash

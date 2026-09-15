@@ -32,6 +32,17 @@
          masking the real exception. Disabling it falls back to normal JNI RegisterNatives, which
          doesn't have either problem. -->
     <AndroidEnableMarshalMethods>false</AndroidEnableMarshalMethods>
+    <!-- A Debug APK must be self-contained ("distributable debug"). Debug defaults
+         EmbedAssembliesIntoApk=false (Fast Deployment), which EXCLUDES the .NET assemblies
+         from the APK and expects them adb-pushed into files/.__override__/<abi> — an APK
+         built that way aborts at startup with "No assemblies found in
+         '.../__override__/arm64-v8a' ... Assuming this is part of Fast Deployment. Exiting..."
+         (monodroid-glue.cc create_domain) whenever it is installed outside an `adb deploy`,
+         e.g. the debug APK published by .github/workflows/build.yml and sideloaded from the
+         browser. Embedding the assemblies keeps the build otherwise Debug-shaped (debuggable,
+         debug-keystore signed, untrimmed, no AOT); it only loses the adb fast-deploy loop —
+         local on-device iteration reinstalls via `adb install -r` instead. -->
+    <EmbedAssembliesIntoApk Condition="'$(Configuration)' == 'Debug'">true</EmbedAssembliesIntoApk>
   </PropertyGroup>
 
   <ItemGroup>
