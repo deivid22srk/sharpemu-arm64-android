@@ -220,7 +220,7 @@ public sealed class X64InterpreterBlockCacheTests
         var code = new byte[]
         {
             0x48, 0xC7, 0xC1, 0x0A, 0x00, 0x00, 0x00, // mov rcx, 10
-            0x48, 0xFF, 0xC0,                          // add rax, 1  (loop:)
+            0x48, 0xFF, 0xC0,                          // inc rax  (loop:)
             0x48, 0xFF, 0xC9,                          // dec rcx
             0x75, 0xF9,                                // jnz loop
             0xC3,                                      // ret
@@ -420,8 +420,8 @@ public sealed class X64InterpreterBlockCacheTests
         var legacyMedian = legacyTicks[rounds / 2];
         var cachedMedian = cachedTicks[rounds / 2];
         var speedup = legacyMedian / Math.Max(1, cachedMedian);
-        var bestSpeedup = legacyTicks.Min() / Math.Max(1, cachedTicks.Max());
-        var worstSpeedup = legacyTicks.Max() / Math.Max(1, cachedTicks.Min());
+        var bestSpeedup = legacyTicks.Max() / Math.Max(1, cachedTicks.Min());
+        var worstSpeedup = legacyTicks.Min() / Math.Max(1, cachedTicks.Max());
         _output.WriteLine(
             $"block-cache benchmark (median of {rounds}, 10-instruction block): " +
             $"legacy={legacyMedian:F0} ticks, cached={cachedMedian:F0} ticks, " +

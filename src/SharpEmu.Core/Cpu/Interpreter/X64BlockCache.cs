@@ -345,6 +345,7 @@ public sealed partial class X64InterpreterBackend
             case Mnemonic.Enter:
             case Mnemonic.Pushfq:
             case Mnemonic.Pushfd:
+            case Mnemonic.Pushf:
                 return true;
         }
 

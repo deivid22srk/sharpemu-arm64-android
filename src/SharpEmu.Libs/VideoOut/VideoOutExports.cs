@@ -189,10 +189,36 @@ public static class VideoOutExports
     /// (the Kotlin/Compose library UI outlives each game run) — without this reset, the
     /// first session's host interrupt would silently swallow every later session's Stop().
     /// The desktop CLI runs one session per process, so calling this before every session is
-    /// harmless there too. <see cref="VblankTickLoop"/> re-arms its thread symmetrically.
+    /// harmless there too. Best-effort drains the previous session's vblank loop first so the
+    /// re-armed latches and the freshly-registered thread cannot interleave (see
+    /// <see cref="VblankTickLoop"/>'s unregister-on-exit).
     /// </summary>
     public static void PrepareNewSession()
     {
+        Thread? draining;
+        lock (_vblankThreadGate)
+        {
+            draining = _vblankThread;
+        }
+
+        if (draining is not null)
+        {
+            // The loop checks _vblankStopRequested every tick, so it leaves promptly; join
+            // best-effort and unregister a finished handle so EnsureVblankThread can spawn a
+            // fresh one for the new session without a race window.
+            draining.Join(TimeSpan.FromMilliseconds(250));
+            if (!draining.IsAlive)
+            {
+                lock (_vblankThreadGate)
+                {
+                    if (ReferenceEquals(_vblankThread, draining))
+                    {
+                        _vblankThread = null;
+                    }
+                }
+            }
+        }
+
         Interlocked.Exchange(ref _presentationWindowCloseNotified, 0);
         Interlocked.Exchange(ref _vblankStopRequested, 0);
     }
@@ -1373,11 +1399,13 @@ public static class VideoOutExports
 
         lock (_vblankThreadGate)
         {
-            if (_vblankThread is not null)
+            if (_vblankThread is not null && _vblankThread.IsAlive)
             {
                 return;
             }
 
+            // A finished-but-unregistered handle (or one left behind by an abnormal loop exit
+            // before its finally ran) must not block respawning for a new session.
             var thread = new Thread(VblankTickLoop)
             {
                 IsBackground = true,

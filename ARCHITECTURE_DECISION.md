@@ -163,17 +163,18 @@ Mono do Android.
 1. **Desempenho mensurável e honesto:** o custo por *dispatch* cai de "validação de
    decodificação por instrução" para "uma validação de intervalo por bloco". O benchmark
    da suíte (`BlockCache_ThroughputBenchmark`, mediana de 5 rodadas aquecidas e
-   alternadas, com faixa de rodadas impressa) mede **1,0×–1,5×** no formato
-   representativo (corpo straight-line de 10 instruções por bloco), dependendo do
-   processo/máquina — e ~paridade em micro-loops de 3 instruções, onde o cache de
-   decodificação por instrução do caminho legado já acerta e o custo domina nos handlers
-   (idênticos nos dois caminhos). É um sinal de smoke, não uma especificação: a variância
-   entre processos é maior que a intra-processo. Os ganhos maiores são estruturais e
-   aparecem onde o cache legado é fraco: conjuntos quentes grandes (o cache legado é
-   direto-mapeado com 65.536 entradas — colisões forçam re-decodificação Iced que o cache
-   de blocos, indexado por dicionário exato, elimina), eliminação da sonda de dicionário
-   de stubs por instrução, e o Mono JIT do Android — onde o custo por instrução de
-   qualquer trabalho de dispatch é maior que no RyuJIT desktop.
+   alternadas, com faixa de rodadas impressa) mediu medianas de **~1,0× a ~2,2×** entre
+   processos/máquinas no formato representativo (corpo straight-line de 10 instruções por
+   bloco) — e ~paridade em micro-loops de 3 instruções, onde o cache de decodificação por
+   instrução do caminho legado já acerta e o custo domina nos handlers (idênticos nos dois
+   caminhos). É um sinal de smoke, não uma especificação: a variância entre processos é
+   maior que a intra-processo, e o número absoluto depende de hardware/JIT. Os ganhos
+   maiores são estruturais e aparecem onde o cache legado é fraco: conjuntos quentes
+   grandes (o cache legado é direto-mapeado com 65.536 entradas — colisões forçam
+   re-decodificação Iced que o cache de blocos, indexado por dicionário exato, elimina),
+   eliminação da sonda de dicionário de stubs por instrução, e o Mono JIT do Android —
+   onde o custo por instrução de qualquer trabalho de dispatch é maior que no RyuJIT
+   desktop.
 2. **Estabilidade:** a execução continua usando **os mesmos handlers** já validados pelos
    ~2.100 linhas de testes existentes do interpretador; não há tradução de código — apenas
    *reuso* de decodificação. Paridade de comportamento é testada (testes de paridade
