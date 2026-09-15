@@ -26,6 +26,11 @@ internal static class GameSession
         SharpEmuLog.MinimumLevel = LogLevel.Debug;
         Log.Info(BuildInfo.Banner);
 
+        // Re-arm the process-wide VideoOut shutdown latches so THIS session's Stop() (and any
+        // cooperative shutdown) is honored even after a previous session in the same process
+        // already consumed them — the app process outlives each game run.
+        VideoOutExports.PrepareNewSession();
+
         // Video presenter setup (Vulkan swapchain) happens inside SharpEmuRuntime.Run once the
         // guest is far enough along to create a display — this call only configures which backend/
         // window mode it will use, mirroring SharpEmu.CLI.Program.RunEmulator.

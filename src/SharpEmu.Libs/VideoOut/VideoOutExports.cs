@@ -183,6 +183,20 @@ public static class VideoOutExports
         RequestHostShutdown("host-interrupt");
     }
 
+    /// <summary>
+    /// Resets the one-shot shutdown latches so a NEW emulation session in the same process
+    /// can request its own cooperative shutdown. Android reuses one process across sessions
+    /// (the Kotlin/Compose library UI outlives each game run) — without this reset, the
+    /// first session's host interrupt would silently swallow every later session's Stop().
+    /// The desktop CLI runs one session per process, so calling this before every session is
+    /// harmless there too. <see cref="VblankTickLoop"/> re-arms its thread symmetrically.
+    /// </summary>
+    public static void PrepareNewSession()
+    {
+        Interlocked.Exchange(ref _presentationWindowCloseNotified, 0);
+        Interlocked.Exchange(ref _vblankStopRequested, 0);
+    }
+
     private static void RequestHostShutdown(string reason)
     {
         Console.Error.WriteLine($"[LOADER][INFO] Host shutdown requested: {reason}");
@@ -1376,50 +1390,67 @@ public static class VideoOutExports
 
     private static void VblankTickLoop()
     {
-        var pending = new List<(ulong Equeue, ulong DataHint, ulong UserData)>();
-        var next = Stopwatch.GetTimestamp();
-        while (Volatile.Read(ref _vblankStopRequested) == 0)
+        try
         {
-            uint refresh = 60;
-            pending.Clear();
-            lock (_stateGate)
+            var pending = new List<(ulong Equeue, ulong DataHint, ulong UserData)>();
+            var next = Stopwatch.GetTimestamp();
+            while (Volatile.Read(ref _vblankStopRequested) == 0)
             {
-                foreach (var port in _ports.Values)
+                uint refresh = 60;
+                pending.Clear();
+                lock (_stateGate)
                 {
-                    if (port.VblankEvents.Count == 0)
+                    foreach (var port in _ports.Values)
                     {
-                        continue;
-                    }
+                        if (port.VblankEvents.Count == 0)
+                        {
+                            continue;
+                        }
 
-                    refresh = port.RefreshRate == 0 ? 60 : port.RefreshRate;
-                    port.VblankCount++;
-                    var dataHint = (port.VblankCount & 0x0000_FFFF_FFFF_FFFFUL) << 16;
-                    foreach (var registration in port.VblankEvents)
-                    {
-                        pending.Add((registration.Equeue, dataHint, registration.UserData));
+                        refresh = port.RefreshRate == 0 ? 60 : port.RefreshRate;
+                        port.VblankCount++;
+                        var dataHint = (port.VblankCount & 0x0000_FFFF_FFFF_FFFFUL) << 16;
+                        foreach (var registration in port.VblankEvents)
+                        {
+                            pending.Add((registration.Equeue, dataHint, registration.UserData));
+                        }
                     }
                 }
-            }
 
-            foreach (var (equeue, dataHint, userData) in pending)
+                foreach (var (equeue, dataHint, userData) in pending)
+                {
+                    _ = KernelEventQueueCompatExports.TriggerDisplayEvent(
+                        equeue,
+                        SceVideoOutInternalEventVblank,
+                        OrbisKernelEventFilterVideoOut,
+                        dataHint,
+                        userData);
+                }
+
+                var interval = Stopwatch.Frequency / Math.Max(1, (long)refresh);
+                next += interval;
+                var now = Stopwatch.GetTimestamp();
+                if (next < now)
+                {
+                    next = now;
+                }
+
+                HostTiming.SleepUntil(next);
+            }
+        }
+        finally
+        {
+            // Symmetric with PrepareNewSession: after a cooperative stop, allow a future
+            // session in the same process to restart the loop (EnsureVblankThread only
+            // spawns when this field is null). Without this, the first Android session's
+            // shutdown would permanently kill vblank cadence for later sessions.
+            lock (_vblankThreadGate)
             {
-                _ = KernelEventQueueCompatExports.TriggerDisplayEvent(
-                    equeue,
-                    SceVideoOutInternalEventVblank,
-                    OrbisKernelEventFilterVideoOut,
-                    dataHint,
-                    userData);
+                if (ReferenceEquals(_vblankThread, Thread.CurrentThread))
+                {
+                    _vblankThread = null;
+                }
             }
-
-            var interval = Stopwatch.Frequency / Math.Max(1, (long)refresh);
-            next += interval;
-            var now = Stopwatch.GetTimestamp();
-            if (next < now)
-            {
-                next = now;
-            }
-
-            HostTiming.SleepUntil(next);
         }
     }
 

@@ -47,10 +47,11 @@ open), instead of re-validating every instruction every time it runs. See
 `src/SharpEmu.Core/Cpu/Interpreter/X64BlockCache.cs` and
 [`ARCHITECTURE_DECISION.md`](./ARCHITECTURE_DECISION.md).
 
-Measured honestly (benchmark in the test suite, median of 5 warmed alternating runs):
-**1.45x** on straight-line-heavy code (10-instruction blocks); ~parity on 3-instruction
-micro-loops, where the legacy per-instruction decode cache already hits and identical
-handler work dominates. The larger wins are structural: the legacy cache is direct-mapped
+Measured honestly (benchmark in the test suite, median of 5 warmed alternating runs with
+round ranges printed): **1.0x-1.5x** on straight-line-heavy code (10-instruction blocks)
+depending on process/machine, ~parity on 3-instruction micro-loops, where the legacy
+per-instruction decode cache already hits and identical handler work dominates — a smoke
+signal, not a spec. The larger wins are structural: the legacy cache is direct-mapped
 (65,536 slots) and re-decodes on collisions that an exact-key block dictionary eliminates,
 stub-dictionary probes drop from per-instruction to per-block, and per-instruction
 dispatch overhead matters more on Android's Mono JIT. The block cache is also the

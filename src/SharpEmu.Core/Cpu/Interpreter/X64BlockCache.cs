@@ -204,8 +204,28 @@ public sealed partial class X64InterpreterBackend
             ? stackalloc byte[256]
             : _blockValidationScratch;
         var window = buffer[..length];
-        return context.Memory.TryRead(cached.StartRip, window) &&
-               window.SequenceEqual(cached.AllBytes);
+        if (context.Memory.TryRead(cached.StartRip, window))
+        {
+            return window.SequenceEqual(cached.AllBytes);
+        }
+
+        // The contiguous read can fail for a block that spans two mapped regions (memory
+        // implementations reject cross-region reads). Validate per instruction instead —
+        // each instruction was readable at build time, so per-instruction reads stay inside
+        // a single region. Same guard, coarser granularity preserved.
+        for (var i = 0; i < cached.InstructionCount; i++)
+        {
+            var instructionBytes = cached.InstructionBytes[i];
+            var encodedLength = cached.Instructions[i].Length;
+            var slice = buffer[..encodedLength];
+            if (!context.Memory.TryRead(cached.Instructions[i].IP, slice) ||
+                !slice.SequenceEqual(instructionBytes.AsSpan(0, encodedLength)))
+            {
+                return false;
+            }
+        }
+
+        return true;
     }
 
     /// <summary>
@@ -323,6 +343,8 @@ public sealed partial class X64InterpreterBackend
             case Mnemonic.Push:
             case Mnemonic.Call:
             case Mnemonic.Enter:
+            case Mnemonic.Pushfq:
+            case Mnemonic.Pushfd:
                 return true;
         }
 
@@ -331,9 +353,13 @@ public sealed partial class X64InterpreterBackend
         {
             switch (info.GetOpAccess(operand))
             {
+                // ReadCondWrite matters: it is the memory shape of cmpxchg/cmpxchg8b/16b —
+                // the classic lock-free patch instruction — which DOES store when the
+                // comparison succeeds. Missing it would leave an intra-block SMC window open.
                 case OpAccess.Write:
                 case OpAccess.CondWrite:
                 case OpAccess.ReadWrite:
+                case OpAccess.ReadCondWrite:
                     switch (instruction.GetOpKind(operand))
                     {
                         case OpKind.Memory:

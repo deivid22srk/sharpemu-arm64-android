@@ -226,8 +226,9 @@ public sealed class X64InterpreterBlockCacheTests
             0xC3,                                      // ret
         };
 
-        // 6 iterations * 3 + entry + ret = 20 instructions total; cut at 9 (mid-block for a
-        // 3-instruction block: add/dec/jnz at offsets 7, 9, 13).
+        // Loop body = 3 instructions per iteration: inc eax @8, dec rcx @10, jnz @13 (rel8
+        // targets offset 8, so 10 iterations: 2 entry instructions + 30 loop instructions
+        // = 32 total). Cut at 9 — mid-block for the 3-instruction block.
         var budget = 9;
 
         var cached = Execute(CreateContext(code), enableBlockCache: true, options: new X64InterpreterOptions { MaxInstructions = budget });
@@ -306,6 +307,45 @@ public sealed class X64InterpreterBlockCacheTests
     }
 
     [Fact]
+    public void BlockCache_IntraBlockSelfModifyingCodeViaCmpxchgExecutesPatchedInstruction()
+    {
+        // Same self-patch shape as the test above, but the writer is cmpxchg — Iced classifies
+        // its memory operand as OpAccess.ReadCondWrite (not Write/ReadWrite), which is exactly
+        // the classification case that would leave the intra-block SMC window open if missed.
+        // inst0 @+0 : mov eax, 0x11111111           (B8 11 11 11 11) — cmpxchg's expected value
+        // inst1 @+5 : mov ecx, 0x2A                 (B9 2A 00 00 00) — replacement value
+        // inst2 @+10: cmpxchg dword ptr [rip+1], ecx (0F B1 0D 01 00 00 00) — target CodeBase+18
+        //             (= rip after inst2 (17) + 1), which is inst3's immediate; comparison
+        //             succeeds (memory still holds 0x11111111), so the store happens.
+        // inst3 @+17: mov ebx, 0x11111111           (BB 11 11 11 11) — patched to 0x2A by inst2
+        // inst4 @+22: ret
+        var code = new byte[23];
+        code[0] = 0xB8;
+        WriteInt32(code, 1, 0x1111_1111);
+        code[5] = 0xB9;
+        WriteInt32(code, 6, 0x2A);
+        code[10] = 0x0F; code[11] = 0xB1; code[12] = 0x0D; // cmpxchg r/m32, ecx (modrm 0D = rip+disp32)
+        WriteInt32(code, 13, 1);
+        code[17] = 0xBB;
+        WriteInt32(code, 18, 0x1111_1111);
+        code[22] = 0xC3;
+
+        var memory = new VirtualMemory();
+        memory.Map(CodeBase, 0x1000, 0, code, ProgramHeaderFlags.Read | ProgramHeaderFlags.Write | ProgramHeaderFlags.Execute);
+        memory.Map(StackBase, StackSize, 0, ReadOnlySpan<byte>.Empty, ProgramHeaderFlags.Read | ProgramHeaderFlags.Write);
+        var context = new CpuContext(memory, Generation.Gen5) { Rip = CodeBase, Rflags = 0x202 };
+        context[CpuRegister.Rsp] = StackBase + StackSize;
+        Assert.True(context.PushUInt64(0));
+
+        var backend = new X64InterpreterBackend(new ModuleManager());
+        var result = backend.Execute(context, CodeBase, new Dictionary<ulong, string>(), new X64InterpreterOptions { MaxInstructions = 1000 });
+
+        Assert.Equal(OrbisGen2Result.ORBIS_GEN2_OK, result.Result);
+        Assert.Equal(0x2AUL, context[CpuRegister.Rbx]); // patched instruction executed
+        Assert.Equal(0x1111_1111UL, context[CpuRegister.Rax]); // cmpxchg succeeded (rax untouched)
+    }
+
+    [Fact]
     public void BlockCache_WritableRegionsValidateEveryExecution()
     {
         // VirtualMemory does not implement TryIsRegionNonWritable/MappingGeneration (interface
@@ -330,7 +370,7 @@ public sealed class X64InterpreterBlockCacheTests
     [Fact]
     public void BlockCache_ThroughputBenchmark()
     {
-        // Loop body = 8 straight-line adds + dec + jnz (10 instructions per block) — a
+        // Loop body = 8 straight-line incs + dec + jnz (10 instructions per block) — a
         // representative straight-line-heavy shape: the cached path pays one block validation
         // per iteration where the legacy path pays one per-instruction decode-cache validation
         // per instruction, on top of identical handler work.
@@ -340,7 +380,7 @@ public sealed class X64InterpreterBlockCacheTests
         };
         for (var i = 0; i < 8; i++)
         {
-            code.AddRange([0x48, 0xFF, 0xC0]); // add rax, 1
+            code.AddRange([0x48, 0xFF, 0xC0]); // inc rax
         }
 
         code.AddRange([0x48, 0xFF, 0xC9]);         // dec rcx  (loop:)
@@ -380,9 +420,13 @@ public sealed class X64InterpreterBlockCacheTests
         var legacyMedian = legacyTicks[rounds / 2];
         var cachedMedian = cachedTicks[rounds / 2];
         var speedup = legacyMedian / Math.Max(1, cachedMedian);
+        var bestSpeedup = legacyTicks.Min() / Math.Max(1, cachedTicks.Max());
+        var worstSpeedup = legacyTicks.Max() / Math.Max(1, cachedTicks.Min());
         _output.WriteLine(
             $"block-cache benchmark (median of {rounds}, 10-instruction block): " +
-            $"legacy={legacyMedian:F0} ticks, cached={cachedMedian:F0} ticks, speedup={speedup:F2}x");
+            $"legacy={legacyMedian:F0} ticks, cached={cachedMedian:F0} ticks, " +
+            $"speedup={speedup:F2}x (round range {bestSpeedup:F2}x-{worstSpeedup:F2}x; " +
+            "cross-process variance is larger — treat as a smoke signal, not a spec)");
 
         Assert.True(legacyMedian > 0 && cachedMedian > 0);
     }

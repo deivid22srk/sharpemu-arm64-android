@@ -118,12 +118,13 @@ Mono do Android.
      revalidam o intervalo de bytes completo a cada despacho. Um bloco que cruza regiões
      usa a política mais conservadora (validação por bytes).
   2. *SMC intra-bloco (a janela que um cache pré-decodificado abriria):* toda instrução
-     do bloco classificada como escrita em memória (via operand-access do Iced, mais
-     push/call/enter) dispara uma revalidação do intervalo do bloco **antes da próxima
-     instrução cacheada executar**; se os bytes mudaram, o bloco é descartado e a próxima
-     instrução é decodificada fresca pelo caminho legado — exatamente o que o caminho
+     do bloco classificada como escrita em memória (via operand-access do Iced — incluindo
+     `ReadCondWrite`, a forma de memória do cmpxchg — mais push/call/enter/pushfq)
+     dispara uma revalidação do intervalo do bloco **antes da próxima instrução cacheada
+     executar**; se os bytes mudaram, o bloco é descartado e a próxima instrução é
+     decodificada fresca pelo caminho legado — exatamente o que o caminho
      instrução-a-instrução faria. Isso fecha a janela que pre-decodificação abriria
-     (coberta pelo teste `BlockCache_IntraBlockSelfModifyingCodeExecutesPatchedInstruction`).
+     (coberta pelos testes de self-patch via `mov` store e via `cmpxchg`).
      Blocos confiáveis (região não-gravável + geração estável) pulam a revalidação: nenhum
      store convidado alcança suas páginas.
   3. *SMC entre threads:* idêntico ao legado em semântica de corrida — a revalidação por
@@ -134,10 +135,16 @@ Mono do Android.
   completa ao atingir o teto — reconstruir é barato e o código quente re-cacheia no
   despacho seguinte), eliminando crescimento sem limite em sessões que recarregam código.
 - **Zero alocação na validação:** intervalos curtos usam `stackalloc`; intervalos longos
-  reutilizam um buffer scratch por backend (o backend é por thread convidada).
+  reutilizam um buffer scratch por backend (o backend é por thread convidada). Blocos que
+  cruzam duas regiões mapeadas (cuja leitura contígua é rejeitada pela memória) caem para
+  validação por instrução, que fica dentro de uma região.
 - **Invariante de 2 páginas:** blocos têm no máximo 960 bytes (< 2 páginas), o que torna
   a checagem de gravabilidade nas duas pontas do bloco suficiente para cobrir todas as
   páginas que ele toca — invariante travada por teste.
+- **Sessões múltiplas no mesmo processo (Android):** os latches one-shot de shutdown do
+  VideoOut são re-armados por sessão (`VideoOutExports.PrepareNewSession()`, chamado no
+  início de cada `GameSession.RunOnCurrentThread`), e a thread de vblank se re-arma
+  simetricamente ao parar — a segunda sessão do app tem shutdown cooperativo completo.
 - **Opção de runtime:** `CpuExecutionOptions.InterpreterBlockCacheDisabled` (padrão:
   **cache ativado** — nome invertido de propósito para que `default(...)` nunca desligue
   o cache silenciosamente), propagada por `CpuDispatcher` →
@@ -154,17 +161,19 @@ Mono do Android.
 ### 3.2 Por que esta é a melhor estratégia a longo prazo
 
 1. **Desempenho mensurável e honesto:** o custo por *dispatch* cai de "validação de
-   decodificação por instrução" para "uma validação de intervalo por bloco". Medição
-   incluída na suíte (`BlockCache_ThroughputBenchmark`, mediana de 5 rodadas aquecidas e
-   alternadas — sem viés de ordem de execução): **1,45×** no formato representativo
-   (corpo straight-line de 10 instruções por bloco) e ~paridade (≈1,0×) em micro-loops de
-   3 instruções, onde o cache de decodificação por instrução do caminho legado já acerta e
-   o custo domina nos handlers (idênticos nos dois caminhos). Os ganhos reais aparecem
-   onde o cache legado é fraco: conjuntos quentes grandes (o cache legado é direto-mapeado
-   com 65.536 entradas — colisões forçam re-decodificação Iced que o cache de blocos,
-   indexado por dicionário exato, elimina), eliminação da sonda de dicionário de stubs por
-   instrução, e o Mono JIT do Android — onde o custo por instrução de qualquer trabalho
-   de dispatch é maior que no RyuJIT desktop.
+   decodificação por instrução" para "uma validação de intervalo por bloco". O benchmark
+   da suíte (`BlockCache_ThroughputBenchmark`, mediana de 5 rodadas aquecidas e
+   alternadas, com faixa de rodadas impressa) mede **1,0×–1,5×** no formato
+   representativo (corpo straight-line de 10 instruções por bloco), dependendo do
+   processo/máquina — e ~paridade em micro-loops de 3 instruções, onde o cache de
+   decodificação por instrução do caminho legado já acerta e o custo domina nos handlers
+   (idênticos nos dois caminhos). É um sinal de smoke, não uma especificação: a variância
+   entre processos é maior que a intra-processo. Os ganhos maiores são estruturais e
+   aparecem onde o cache legado é fraco: conjuntos quentes grandes (o cache legado é
+   direto-mapeado com 65.536 entradas — colisões forçam re-decodificação Iced que o cache
+   de blocos, indexado por dicionário exato, elimina), eliminação da sonda de dicionário
+   de stubs por instrução, e o Mono JIT do Android — onde o custo por instrução de
+   qualquer trabalho de dispatch é maior que no RyuJIT desktop.
 2. **Estabilidade:** a execução continua usando **os mesmos handlers** já validados pelos
    ~2.100 linhas de testes existentes do interpretador; não há tradução de código — apenas
    *reuso* de decodificação. Paridade de comportamento é testada (testes de paridade
