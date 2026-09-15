@@ -163,7 +163,7 @@ public sealed class SharpEmuRuntime : ISharpEmuRuntime
         }
 
         HleDataSymbols.ConfigureProcessImageName(processImageName);
-        if (_cpuExecutionOptions.CpuEngine != CpuExecutionEngine.Interpreter ||
+        if ((_cpuExecutionOptions.CpuEngine != CpuExecutionEngine.Interpreter && _cpuExecutionOptions.CpuEngine != CpuExecutionEngine.JitRecompiler) ||
             !TryMergeKnownGuestHleDataSymbols(activeRuntimeSymbols, processImageName))
         {
             MergeKnownHleDataSymbols(activeRuntimeSymbols);

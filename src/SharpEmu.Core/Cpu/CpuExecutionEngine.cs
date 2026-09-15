@@ -8,4 +8,6 @@ public enum CpuExecutionEngine
     NativeOnly = 0,
 
     Interpreter = 1,
+
+    JitRecompiler = 2,
 }

@@ -52,9 +52,8 @@ internal static class GameSession
 
         var options = new SharpEmuRuntimeOptions
         {
-            // Android/ARM64 has no native guest-execution path — see CheckHostArchitecture and
-            // CpuDispatcher's own Android guard on the desktop side; this is the only valid value.
-            CpuEngine = CpuExecutionEngine.Interpreter,
+            // On Android/ARM64, use the native ARM64 JIT recompiler engine for real dynamic binary translation.
+            CpuEngine = CpuExecutionEngine.JitRecompiler,
         };
 
         using var runtime = SharpEmuRuntime.CreateDefault(options);

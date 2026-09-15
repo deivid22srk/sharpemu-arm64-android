@@ -21,6 +21,16 @@ public sealed class CpuContext(ICpuMemory memory, Generation generation)
 
     public ulong Rip { get; set; }
 
+    public unsafe ulong* GetRegistersPointer()
+    {
+        fixed (ulong* ptr = _registers)
+        {
+            return ptr;
+        }
+    }
+
+    public ulong[] RegistersArray => _registers;
+
     /// <summary>
     /// Index of the import this context is currently executing, or -1 when it is
     /// running guest code. Only maintained while guest profiling is enabled;

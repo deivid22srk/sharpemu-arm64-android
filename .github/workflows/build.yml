@@ -1,0 +1,80 @@
+# Copyright (C) 2026 SharpEmu Emulator Project
+# SPDX-License-Identifier: GPL-2.0-or-later
+
+name: Build Android APK (Debug)
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - main
+      - master
+      - 'feature/**'
+  pull_request:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: android-debug-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  APK_NAME: SharpEmu-Android-Debug.apk
+
+jobs:
+  build-debug:
+    name: Build Android Debug APK
+    runs-on: windows-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v6
+
+      - name: Setup JDK
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+
+      - name: Setup .NET SDK
+        uses: actions/setup-dotnet@v5
+        with:
+          dotnet-version: 10.0.103
+
+      - name: Install Android workload
+        run: dotnet workload install android
+
+      - name: Clean Gradle build outputs
+        shell: bash
+        run: rm -rf platform/android/app/build platform/android/.gradle
+
+      - name: Grant execute permission for gradlew
+        shell: bash
+        run: chmod +x platform/android/gradlew
+
+      - name: Build Kotlin/Compose library (.aar)
+        working-directory: platform/android
+        shell: bash
+        run: ./gradlew :app:assembleRelease
+
+      - name: Clean .NET Android build outputs
+        shell: bash
+        run: rm -rf artifacts/obj/SharpEmu.Android artifacts/bin/Debug/net10.0-android
+
+      - name: Build Android APK (Debug)
+        run: dotnet build src/SharpEmu.Android/SharpEmu.Android.csproj -c Debug -f net10.0-android
+
+      - name: Locate and Rename Debug APK artifact
+        shell: bash
+        run: |
+          set -euo pipefail
+          apk="$(find artifacts/bin/Debug/net10.0-android -iname '*.apk' | head -n1)"
+          test -n "$apk"
+          cp "$apk" "$APK_NAME"
+
+      - name: Upload build artifact
+        uses: actions/upload-artifact@v7
+        with:
+          name: sharpemu-android-debug
+          path: ${{ env.APK_NAME }}
+          if-no-files-found: error
