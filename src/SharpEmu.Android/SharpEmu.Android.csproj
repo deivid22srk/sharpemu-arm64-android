@@ -23,6 +23,8 @@
          disabled together here for that reason. -->
     <PublishTrimmed>false</PublishTrimmed>
     <RunAOTCompilation>false</RunAOTCompilation>
+    <!-- Always embed .NET assemblies into the standalone APK (prevents Fast Deployment missing-assembly crashes on Debug APKs) -->
+    <EmbedAssembliesIntoApk>true</EmbedAssembliesIntoApk>
     <!-- Marshal Methods (default on for Release) generates native-to-managed JNI trampolines
          ("n_Xxx_mm_wrapper") ahead of time instead of registering methods dynamically. Confirmed by
          two separate on-device failures: (1) UnsatisfiedLinkError for a completely unrelated class's
