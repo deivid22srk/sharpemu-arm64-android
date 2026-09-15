@@ -48,6 +48,10 @@ jobs:
         shell: bash
         run: rm -rf platform/android/app/build platform/android/.gradle
 
+      - name: Grant execute permission for gradlew
+        shell: bash
+        run: chmod +x platform/android/gradlew
+
       - name: Build Kotlin/Compose library (.aar) - Debug
         working-directory: platform/android
         shell: bash
